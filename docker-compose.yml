@@ -4,11 +4,11 @@ services:
     image: memcached:latest
     networks:
       - 1min-relay-network
-    restart: unless-stopped
+    restart: always
     # Does not require to expose port. Only used for internal communication.
   # 1min-relay
   1min-relay:
-    image: kokofixcomputers/1min-relay:latest
+    image: chelaxian/1min-relay:latest
     container_name: 1min-relay-container
     ports:
       - "5001:5001"
@@ -21,7 +21,7 @@ services:
       - SUBSET_OF_ONE_MIN_PERMITTED_MODELS=mistral-nemo,gpt-4o-mini,deepseek-chat
       # Set your boolean as "True" or "False" for PERMIT_MODELS_FROM_SUBSET_ONLY Default: False
       - PERMIT_MODELS_FROM_SUBSET_ONLY=False
-    restart: unless-stopped
+    restart: always
 
 networks:
   1min-relay-network:  # Define the custom network
