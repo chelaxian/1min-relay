@@ -19,14 +19,17 @@ from io import BytesIO
 import coloredlogs
 import printedcolors
 import base64
+import pdfplumber
+from docx import Document as DocxDocument
+import yaml
+from PIL import Image
+import io
 
 # Suppress warnings from flask_limiter
 warnings.filterwarnings("ignore", category=UserWarning, module="flask_limiter.extension")
 
 # Create a logger object
 logger = logging.getLogger("1min-relay")
-
-# Install coloredlogs with desired log level
 coloredlogs.install(level='DEBUG', logger=logger)
 
 def check_memcached_connection(host='memcached', port=11211):
@@ -40,22 +43,18 @@ def check_memcached_connection(host='memcached', port=11211):
             return False
     except:
         return False
-        
+
 logger.info('''
-    _ __  __ _      ___     _           
- / |  \/  (_)_ _ | _ \___| |__ _ _  _ 
+ / |  \/  (_)_ _ | _ \___| |    
  | | |\/| | | ' \|   / -_) / _` | || |
  |_|_|  |_|_|_||_|_|_\___|_\__,_|\_, |
-                                 |__/ ''')
-
+        |__/ ''')
 
 def calculate_token(sentence, model="DEFAULT"):
     """Calculate the number of tokens in a sentence based on the specified model."""
-    
     if model.startswith("mistral"):
-        # Initialize the Mistral tokenizer
         tokenizer = MistralTokenizer.v3(is_tekken=True)
-        model_name = "open-mistral-nemo" # Default to Mistral Nemo
+        model_name = "open-mistral-nemo"  # Default to Mistral Nemo
         tokenizer = MistralTokenizer.from_model(model_name)
         tokenized = tokenizer.encode_chat_completion(
             ChatCompletionRequest(
@@ -67,19 +66,17 @@ def calculate_token(sentence, model="DEFAULT"):
         )
         tokens = tokenized.tokens
         return len(tokens)
-
     elif model in ["gpt-3.5-turbo", "gpt-4"]:
-        # Use OpenAI's tiktoken for GPT models
         encoding = tiktoken.encoding_for_model(model)
         tokens = encoding.encode(sentence)
         return len(tokens)
-
     else:
-        # Default to openai
         encoding = tiktoken.encoding_for_model("gpt-4")
         tokens = encoding.encode(sentence)
         return len(tokens)
+
 app = Flask(__name__)
+
 if check_memcached_connection():
     limiter = Limiter(
         get_remote_address,
@@ -87,13 +84,11 @@ if check_memcached_connection():
         storage_uri="memcached://memcached:11211",  # Connect to Memcached created with docker
     )
 else:
-    # Used for ratelimiting without memcached
     limiter = Limiter(
         get_remote_address,
         app=app,
     )
     logger.warning("Memcached is not available. Using in-memory storage for rate limiting. Not-Recommended")
-
 
 ONE_MIN_API_URL = "https://api.1min.ai/api/features"
 ONE_MIN_CONVERSATION_API_URL = "https://api.1min.ai/api/conversations"
@@ -123,12 +118,10 @@ ALL_ONE_MIN_AVAILABLE_MODELS = [
     "mistral-small-latest",
     "mistral-nemo",
     "open-mistral-7b",
-
-   # Replicate
-   "meta/llama-2-70b-chat", 
-   "meta/meta-llama-3-70b-instruct", 
-   "meta/meta-llama-3.1-405b-instruct", 
-   "command"
+    "meta/llama-2-70b-chat", 
+    "meta/meta-llama-3-70b-instruct", 
+    "meta/meta-llama-3.1-405b-instruct", 
+    "command"
 ]
 
 # Define the models that support vision inputs
@@ -137,7 +130,6 @@ vision_supported_models = [
     "gpt-4o-mini",
     "gpt-4-turbo"
 ]
-
 
 # Default values
 SUBSET_OF_ONE_MIN_PERMITTED_MODELS = ["mistral-nemo", "gpt-4o", "deepseek-chat"]
@@ -150,7 +142,6 @@ permit_not_in_available_env = os.getenv("PERMIT_MODELS_FROM_SUBSET_ONLY")  # e.g
 # Parse or fall back to defaults
 if one_min_models_env:
     SUBSET_OF_ONE_MIN_PERMITTED_MODELS = one_min_models_env.split(",")
-
 if permit_not_in_available_env and permit_not_in_available_env.lower() == "true":
     PERMIT_MODELS_FROM_SUBSET_ONLY = True
 
@@ -165,19 +156,14 @@ def index():
     if request.method == 'GET':
         internal_ip = socket.gethostbyname(socket.gethostname())
         return "Congratulations! Your API is working! You can now make requests to the API.\n\nEndpoint: " + internal_ip + ':5001/v1'
+
 @app.route('/v1/models')
 @limiter.limit("500 per minute")
 def models():
-    # Dynamically create the list of models with additional fields
     models_data = []
     if not PERMIT_MODELS_FROM_SUBSET_ONLY:
         one_min_models_data = [
-            {
-                "id": model_name,
-                "object": "model",
-                "owned_by": "1minai",
-                "created": 1727389042
-            }
+            {"id": model_name, "object": "model", "owned_by": "1minai", "created": 1727389042}
             for model_name in ALL_ONE_MIN_AVAILABLE_MODELS
         ]
     else:
@@ -189,8 +175,7 @@ def models():
     return jsonify({"data": models_data, "object": "list"})
 
 def ERROR_HANDLER(code, model=None, key=None):
-    # Handle errors in OpenAI-Structued Error
-    error_codes = { # Internal Error Codes
+    error_codes = {
         1002: {"message": f"The model {model} does not exist.", "type": "invalid_request_error", "param": None, "code": "model_not_found", "http_code": 400},
         1020: {"message": f"Incorrect API key provided: {key}. You can find your API key at https://app.1min.ai/api.", "type": "authentication_error", "param": None, "code": "invalid_api_key", "http_code": 401},
         1021: {"message": "Invalid Authentication", "type": "invalid_request_error", "param": None, "code": None, "http_code": 401},
@@ -199,108 +184,86 @@ def ERROR_HANDLER(code, model=None, key=None):
         1412: {"message": f"No message provided.", "type": "invalid_request_error", "param": "messages", "code": "invalid_request_error", "http_code": 400},
         1423: {"message": f"No content in last message.", "type": "invalid_request_error", "param": "messages", "code": "invalid_request_error", "http_code": 400},
     }
-    error_data = {k: v for k, v in error_codes.get(code, {"message": "Unknown error", "type": "unknown_error", "param": None, "code": None}).items() if k != "http_code"} # Remove http_code from the error data
+    error_data = {k: v for k, v in error_codes.get(code, {"message": "Unknown error", "type": "unknown_error", "param": None, "code": None}).items() if k != "http_code"}
     logger.error(f"An error has occurred while processing the user's request. Error code: {code}")
-    return jsonify({"error": error_data}), error_codes.get(code, {}).get("http_code", 400) # Return the error data without http_code inside the payload and get the http_code to return.
+    return jsonify({"error": error_data}), error_codes.get(code, {}).get("http_code", 400)
 
 def format_conversation_history(messages, new_input):
-    """
-    Formats the conversation history into a structured string.
-    
-    Args:
-        messages (list): List of message dictionaries from the request
-        new_input (str): The new user input message
-    
-    Returns:
-        str: Formatted conversation history
-    """
     formatted_history = ["Conversation History:\n"]
-    
     for message in messages:
         role = message.get('role', '').capitalize()
         content = message.get('content', '')
-        
-        # Handle potential list content
         if isinstance(content, list):
             content = '\n'.join(item['text'] for item in content if 'text' in item)
-        
         formatted_history.append(f"{role}: {content}")
-    
-    # Append additional messages only if there are existing messages
-    if messages: # Save credits if it is the first message.
+    if messages:
         formatted_history.append("Respond like normal. The conversation history will be automatically updated on the next MESSAGE. DO NOT ADD User: or Assistant: to your output. Just respond like normal.")
         formatted_history.append("User Message:\n")
     formatted_history.append(new_input) 
-    
     return '\n'.join(formatted_history)
-
 
 @app.route('/v1/chat/completions', methods=['POST', 'OPTIONS'])
 @limiter.limit("500 per minute")
 def conversation():
     if request.method == 'OPTIONS':
         return handle_options_request()
-    image = False
-    
 
     auth_header = request.headers.get('Authorization')
     if not auth_header or not auth_header.startswith("Bearer "):
         logger.error("Invalid Authentication")
         return ERROR_HANDLER(1021)
-    
-    api_key = auth_header.split(" ")[1]
-    
-    headers = {
-        'API-KEY': api_key
-    }
-    
-    request_data = request.json
-    
-    all_messages = format_conversation_history(request_data.get('messages', []), request_data.get('new_input', ''))
 
+    api_key = auth_header.split(" ")[1]
+    headers = {'API-KEY': api_key}
+
+    request_data = request.json
+    all_messages = format_conversation_history(request_data.get('messages', []), request_data.get('new_input', ''))
     messages = request_data.get('messages', [])
+
     if not messages:
         return ERROR_HANDLER(1412)
 
     user_input = messages[-1].get('content')
+
     if not user_input:
         return ERROR_HANDLER(1423)
 
-    # Check if user_input is a list and combine text if necessary
+    # Handle file uploads
+    if isinstance(user_input, dict) and 'file' in user_input:
+        file_content = handle_file_upload(user_input['file'])
+        if file_content:
+            user_input = file_content
+        else:
+            return ERROR_HANDLER(1423)
+
+    # Handle images
     image = False
     if isinstance(user_input, list):
+        combined_text = ""
         for item in user_input:
             if 'text' in item:
-                combined_text = '\n'.join(item['text'])
-            try:
-                if 'image_url' in item:
-                    if request_data.get('model', 'mistral-nemo') not in vision_supported_models:
-                        return ERROR_HANDLER(1044, request_data.get('model', 'mistral-nemo'))
-                    if item['image_url']['url'].startswith("data:image/png;base64,"):
-                        base64_image = item['image_url']['url'].split(",")[1]
-                        binary_data = base64.b64decode(base64_image)
-                    else:
-                        binary_data = requests.get(item['image_url']['url'])
-                        binary_data.raise_for_status()  # Raise an error for bad responses
-                        binary_data = BytesIO(binary_data.content)
-                    files = {
-                        'asset': ("relay" + str(uuid.uuid4()), binary_data, 'image/png')
-                    }
+                combined_text += item['text']
+            if 'image_url' in item:
+                if request_data.get('model', 'mistral-nemo') not in vision_supported_models:
+                    return ERROR_HANDLER(1044, request_data.get('model', 'mistral-nemo'))
+                try:
+                    binary_data = handle_image_upload(item['image_url']['url'])
+                    files = {'asset': ("relay" + str(uuid.uuid4()), binary_data, 'image/png')}
                     asset = requests.post(ONE_MIN_ASSET_URL, files=files, headers=headers)
-                    asset.raise_for_status()  # Raise an error for bad responses
+                    asset.raise_for_status()
                     image_path = asset.json()['fileContent']['path']
                     image = True
-            except Exception as e:
-                print(f"An error occurred e:" + str(e)[:60])
-                # Optionally log the error or return an appropriate response
-
-        user_input = str(combined_text)
+                except Exception as e:
+                    logger.error(f"An error occurred while processing the image: {str(e)}")
+                    return ERROR_HANDLER(1044, request_data.get('model', 'mistral-nemo'))
+        user_input = combined_text
 
     prompt_token = calculate_token(str(all_messages))
+
     if PERMIT_MODELS_FROM_SUBSET_ONLY and request_data.get('model', 'mistral-nemo') not in AVAILABLE_MODELS:
-        return ERROR_HANDLER(1002, request_data.get('model', 'mistral-nemo')) # Handle invalid model
-    
-    logger.debug(f"Proccessing {prompt_token} prompt tokens with model {request_data.get('model', 'mistral-nemo')}")
+        return ERROR_HANDLER(1002, request_data.get('model', 'mistral-nemo'))
+
+    logger.debug(f"Processing {prompt_token} prompt tokens with model {request_data.get('model', 'mistral-nemo')}")
 
     if not image:
         payload = {
@@ -322,25 +285,18 @@ def conversation():
                 "imageList": [image_path]
             }
         }
-    
+
     headers = {"API-KEY": api_key, 'Content-Type': 'application/json'}
 
     if not request_data.get('stream', False):
-        # Non-Streaming Response
-        logger.debug("Non-Streaming AI Response")
         response = requests.post(ONE_MIN_API_URL, json=payload, headers=headers)
         response.raise_for_status()
         one_min_response = response.json()
-        
         transformed_response = transform_response(one_min_response, request_data, prompt_token)
         response = make_response(jsonify(transformed_response))
         set_response_headers(response)
-        
         return response, 200
-    
     else:
-        # Streaming Response
-        logger.debug("Streaming AI Response")
         response_stream = requests.post(ONE_MIN_CONVERSATION_API_STREAMING_URL, data=json.dumps(payload), headers=headers, stream=True)
         if response_stream.status_code != 200:
             if response_stream.status_code == 401:
@@ -348,6 +304,34 @@ def conversation():
             logger.error(f"An unknown error occurred while processing the user's request. Error code: {response_stream.status_code}")
             return ERROR_HANDLER(response_stream.status_code)
         return Response(stream_response(response_stream, request_data, request_data.get('model', 'mistral-nemo'), int(prompt_token)), content_type='text/event-stream')
+
+def handle_file_upload(file):
+    if file.filename.endswith('.pdf'):
+        with pdfplumber.open(file) as pdf:
+            text = "\n".join(page.extract_text() for page in pdf.pages)
+        return text
+    elif file.filename.endswith('.docx'):
+        doc = DocxDocument(file)
+        text = "\n".join(paragraph.text for paragraph in doc.paragraphs)
+        return text
+    elif file.filename.endswith('.yaml') or file.filename.endswith('.yml'):
+        yaml_content = yaml.safe_load(file)
+        return str(yaml_content)
+    elif file.filename.endswith('.txt'):
+        return file.read().decode('utf-8')
+    else:
+        return None
+
+def handle_image_upload(image_url):
+    if image_url.startswith("data:image/png;base64,"):
+        base64_image = image_url.split(",")[1]
+        binary_data = base64.b64decode(base64_image)
+    else:
+        response = requests.get(image_url)
+        response.raise_for_status()
+        binary_data = response.content
+    return binary_data
+
 def handle_options_request():
     response = make_response()
     response.headers.add('Access-Control-Allow-Origin', '*')
@@ -380,17 +364,16 @@ def transform_response(one_min_response, request_data, prompt_token):
             "total_tokens": prompt_token + completion_token
         }
     }
-    
+
 def set_response_headers(response):
     response.headers['Content-Type'] = 'application/json'
-    response.headers['Access -Control-Allow-Origin'] = '*'
-    response.headers['X-Request-ID'] = str (uuid.uuid4())
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['X-Request-ID'] = str(uuid.uuid4())
 
 def stream_response(response, request_data, model, prompt_tokens):
     all_chunks = ""
     for chunk in response.iter_content(chunk_size=1024):
         finish_reason = None
-
         return_chunk = {
             "id": f"chatcmpl-{uuid.uuid4()}",
             "object": "chat.completion.chunk",
@@ -408,12 +391,9 @@ def stream_response(response, request_data, model, prompt_tokens):
         }
         all_chunks += chunk.decode('utf-8')
         yield f"data: {json.dumps(return_chunk)}\n\n"
-        
     tokens = calculate_token(all_chunks)
     logger.debug(f"Finished processing streaming response. Completion tokens: {str(tokens)}")
     logger.debug(f"Total tokens: {str(tokens + prompt_tokens)}")
-        
-    # Final chunk when iteration stops
     final_chunk = {
         "id": f"chatcmpl-{uuid.uuid4()}",
         "object": "chat.completion.chunk",
@@ -450,4 +430,4 @@ Enter this url to OpenAI clients supporting custom endpoint:
 If does not work, try:
 {internal_ip}:5001/v1/chat/completions
 {printedcolors.Color.reset}""")
-    serve(app, host='0.0.0.0', port=5001, threads=6) # Thread has a default of 4 if not specified. We use 6 to increase performance and allow multiple requests at once.
+    serve(app, host='0.0.0.0', port=5001, threads=6)
