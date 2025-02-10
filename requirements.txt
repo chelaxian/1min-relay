@@ -7,6 +7,6 @@ limits[memcached]==4.0.1
 coloredlogs==15.0.1
 printedcolors==1.0.0
 pymemcache==4.0.0
-pdfplumber       0.9.0
-python-docx      1.1.0
-pyyaml           6.0.1
+pdfplumber==0.9.0
+python-docx==1.1.0
+pyyaml==6.0.1
