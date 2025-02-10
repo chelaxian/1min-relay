@@ -217,7 +217,6 @@ def conversation():
     headers = {'API-KEY': api_key}
 
     request_data = request.json
-    all_messages = format_conversation_history(request_data.get('messages', []), request_data.get('new_input', ''))
     messages = request_data.get('messages', [])
 
     if not messages:
@@ -228,36 +227,35 @@ def conversation():
     if not user_input:
         return ERROR_HANDLER(1423)
 
-    # Handle file uploads
-    if isinstance(user_input, dict) and 'file' in user_input:
-        file_content = handle_file_upload(user_input['file'])
-        if file_content:
-            user_input = file_content
-        else:
-            return ERROR_HANDLER(1423)
-
-    # Handle images
+    # Проверка на наличие изображений
     image = False
+    image_path = None
+    combined_text = ""
+
     if isinstance(user_input, list):
-        combined_text = ""
         for item in user_input:
             if 'text' in item:
-                combined_text += item['text']
+                combined_text += item['text'] + "\n"
             if 'image_url' in item:
                 if request_data.get('model', 'mistral-nemo') not in vision_supported_models:
                     return ERROR_HANDLER(1044, request_data.get('model', 'mistral-nemo'))
+
                 try:
-                    binary_data = handle_image_upload(item['image_url']['url'])
+                    image_url = item['image_url']['url']
+                    binary_data = handle_image_upload(image_url)
                     files = {'asset': ("relay" + str(uuid.uuid4()), binary_data, 'image/png')}
-                    asset = requests.post(ONE_MIN_ASSET_URL, files=files, headers=headers)
-                    asset.raise_for_status()
-                    image_path = asset.json()['fileContent']['path']
+                    asset_response = requests.post(ONE_MIN_ASSET_URL, files=files, headers=headers)
+                    asset_response.raise_for_status()
+                    image_path = asset_response.json()['fileContent']['path']
                     image = True
                 except Exception as e:
                     logger.error(f"An error occurred while processing the image: {str(e)}")
                     return ERROR_HANDLER(1044, request_data.get('model', 'mistral-nemo'))
-        user_input = combined_text
 
+        user_input = combined_text.strip()
+
+    # Формирование истории диалога
+    all_messages = format_conversation_history(messages, user_input)
     prompt_token = calculate_token(str(all_messages))
 
     if PERMIT_MODELS_FROM_SUBSET_ONLY and request_data.get('model', 'mistral-nemo') not in AVAILABLE_MODELS:
@@ -323,10 +321,12 @@ def handle_file_upload(file):
         return None
 
 def handle_image_upload(image_url):
-    if image_url.startswith("data:image/png;base64,"):
+    if image_url.startswith("data:image"):
+        # Base64-encoded image
         base64_image = image_url.split(",")[1]
         binary_data = base64.b64decode(base64_image)
     else:
+        # URL of the image
         response = requests.get(image_url)
         response.raise_for_status()
         binary_data = response.content
