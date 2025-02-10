@@ -242,15 +242,76 @@ def conversation():
 
                 try:
                     image_url = item['image_url']['url']
+                    logger.debug(f"Processing image URL: {image_url}")
+                    
                     binary_data = handle_image_upload(image_url)
+                    logger.debug("Image successfully processed and converted to binary data.")
+
                     files = {'asset': ("relay" + str(uuid.uuid4()), binary_data, 'image/png')}
+                    logger.debug("Uploading image to 1minAI asset endpoint...")
+                    
                     asset_response = requests.post(ONE_MIN_ASSET_URL, files=files, headers=headers)
                     asset_response.raise_for_status()
+                    
+                    logger.debug(f"Asset upload response: {asset_response.json()}")
                     image_path = asset_response.json()['fileContent']['path']
+                    logger.debug(f"Image uploaded successfully. Image path: {image_path}")
+                    
                     image = True
                 except Exception as e:
                     logger.error(f"An error occurred while processing the image: {str(e)}")
                     return ERROR_HANDLER(1044, request_data.get('model', 'mistral-nemo'))
+
+        user_input = combined_text.strip()
+
+    # Формирование истории диалога
+    all_messages = format_conversation_history(messages, user_input)
+    prompt_token = calculate_token(str(all_messages))
+
+    if PERMIT_MODELS_FROM_SUBSET_ONLY and request_data.get('model', 'mistral-nemo') not in AVAILABLE_MODELS:
+        return ERROR_HANDLER(1002, request_data.get('model', 'mistral-nemo'))
+
+    logger.debug(f"Processing {prompt_token} prompt tokens with model {request_data.get('model', 'mistral-nemo')}")
+
+    if not image:
+        payload = {
+            "type": "CHAT_WITH_AI",
+            "model": request_data.get('model', 'mistral-nemo'),
+            "promptObject": {
+                "prompt": all_messages,
+                "isMixed": False,
+                "webSearch": False
+            }
+        }
+    else:
+        payload = {
+            "type": "CHAT_WITH_IMAGE",
+            "model": request_data.get('model', 'mistral-nemo'),
+            "promptObject": {
+                "prompt": all_messages,
+                "isMixed": False,
+                "imageList": [image_path]
+            }
+        }
+
+    headers = {"API-KEY": api_key, 'Content-Type': 'application/json'}
+
+    if not request_data.get('stream', False):
+        response = requests.post(ONE_MIN_API_URL, json=payload, headers=headers)
+        response.raise_for_status()
+        one_min_response = response.json()
+        transformed_response = transform_response(one_min_response, request_data, prompt_token)
+        response = make_response(jsonify(transformed_response))
+        set_response_headers(response)
+        return response, 200
+    else:
+        response_stream = requests.post(ONE_MIN_CONVERSATION_API_STREAMING_URL, data=json.dumps(payload), headers=headers, stream=True)
+        if response_stream.status_code != 200:
+            if response_stream.status_code == 401:
+                return ERROR_HANDLER(1020)
+            logger.error(f"An unknown error occurred while processing the user's request. Error code: {response_stream.status_code}")
+            return ERROR_HANDLER(response_stream.status_code)
+        return Response(stream_response(response_stream, request_data, request_data.get('model', 'mistral-nemo'), int(prompt_token)), content_type='text/event-stream')
 
         user_input = combined_text.strip()
 
@@ -323,13 +384,17 @@ def handle_file_upload(file):
 def handle_image_upload(image_url):
     if image_url.startswith("data:image"):
         # Base64-encoded image
+        logger.debug("Detected Base64-encoded image.")
         base64_image = image_url.split(",")[1]
         binary_data = base64.b64decode(base64_image)
+        logger.debug("Base64 image successfully decoded.")
     else:
         # URL of the image
+        logger.debug(f"Downloading image from URL: {image_url}")
         response = requests.get(image_url)
         response.raise_for_status()
         binary_data = response.content
+        logger.debug("Image successfully downloaded from URL.")
     return binary_data
 
 def handle_options_request():
