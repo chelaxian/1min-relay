@@ -948,6 +948,15 @@ def conversation():
     if not messages:
         return ERROR_HANDLER(1412)
     
+    # Add system info to last user message if it was a converted DOC/DOCX file
+    last_message = messages[-1]
+    if last_message.get('role') == 'user' and 'doc_file_conversion' in request.headers:
+        original_filename = request.headers.get('doc_file_conversion')
+        # Only modify content if it's a string
+        if isinstance(last_message.get('content'), str):
+            logger.debug(f"Adding note about DOC/DOCX conversion for file: {original_filename}")
+            last_message['content'] += f"\n\n(Примечание: Этот текст был извлечен из файла {original_filename}. Некоторое форматирование могло быть потеряно при конвертации.)"
+    
     # Extract system message if present
     system_prompt = None
     for msg in messages:
@@ -1710,14 +1719,23 @@ def files():
                     
                     try:
                         # Extract text
+                        logger.debug(f"Extracting text from file with extension {file_ext}")
                         if file_ext == '.docx':
                             # Use docx2txt for DOCX
-                            text_content = docx2txt.process(temp_file_path)
+                            logger.debug("Using docx2txt to process DOCX file")
+                            try:
+                                text_content = docx2txt.process(temp_file_path)
+                                logger.debug(f"Successfully extracted text from DOCX file, length: {len(text_content)} characters")
+                            except Exception as docx_err:
+                                logger.error(f"Error processing DOCX file with docx2txt: {str(docx_err)}")
+                                text_content = "Error extracting text from DOCX file."
                         else:
                             # Use python-docx for DOC (with conversion limitations)
+                            logger.debug("Using python-docx to process DOC file")
                             try:
                                 doc = DocxDocument(temp_file_path)
                                 text_content = "\n".join([para.text for para in doc.paragraphs])
+                                logger.debug(f"Successfully extracted text from DOC file, length: {len(text_content)} characters")
                             except Exception as doc_err:
                                 logger.error(f"Error processing DOC file with python-docx: {str(doc_err)}")
                                 text_content = "Error extracting text from DOC file. Please convert to DOCX or PDF format."
@@ -1729,6 +1747,10 @@ def files():
                         # Upload the text file instead
                         logger.debug(f"Uploading converted text file: {text_filename}")
                         upload_result = upload_file_to_1min(text_file_io, text_filename, 'text/plain', api_key)
+                        
+                        # Add a note about the conversion for the original request
+                        logger.debug(f"Adding note about file conversion from {file.filename} to {text_filename}")
+                        original_filename = file.filename
                     finally:
                         # Clean up
                         if os.path.exists(temp_file_path):
