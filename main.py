@@ -194,14 +194,14 @@ tools_supported_models = [
 ]
 
 # Define models that support text-to-speech
-# tts_supported_models = [
+tts_supported_models = [
 #     "nova", 
 #     "alloy", 
 #     "echo", 
 #     "fable", 
 #     "onyx", 
 #     "shimmer"
-# ]
+]
 
 # Define models that support web search
 web_search_supported_models = [
