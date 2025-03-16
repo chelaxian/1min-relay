@@ -144,13 +144,13 @@ ALL_ONE_MIN_AVAILABLE_MODELS = [
     "mistral-small-latest",
     "mistral-nemo",
     "open-mistral-7b",
-    
+
     # STT
     #"whisper-1", 
 
     # TTS
     #"alloy", 
-
+    
    # Replicate
    "meta/llama-2-70b-chat", 
    "meta/meta-llama-3-70b-instruct", 
