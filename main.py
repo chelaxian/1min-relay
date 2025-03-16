@@ -1106,8 +1106,23 @@ def conversation():
     if model in web_search_supported_models and not use_web_search:
         # Проверяем наличие ключевых слов для поиска в интернете
         search_keywords = ['найди', 'поищи', 'search', 'найти', 'поиск', 'погугли', 'загугли']
-        user_message = messages[-1].get('content', '').lower()
-        if any(keyword in user_message.lower() for keyword in search_keywords):
+        content = messages[-1].get('content', '')
+        
+        # Проверка типа контента и обработка соответствующим образом
+        if isinstance(content, list):
+            # Для мультимодального контента извлекаем текст
+            text_parts = []
+            for item in content:
+                if isinstance(item, dict) and 'text' in item:
+                    text_parts.append(item['text'])
+                elif isinstance(item, dict) and item.get('type') == 'text':
+                    text_parts.append(item.get('text', ''))
+            user_message = ' '.join(text_parts).lower()
+        else:
+            # Для обычного текстового контента
+            user_message = content.lower()
+            
+        if any(keyword in user_message for keyword in search_keywords):
             use_web_search = True
             logger.info(f"Automatically enabling web search for model {model} based on user message")
     
