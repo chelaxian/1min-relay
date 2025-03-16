@@ -1268,6 +1268,21 @@ def conversation():
     if not request.is_json:
         return ERROR_HANDLER(1400, detail="Request must be JSON")
     
+    # Извлекаем API-ключ
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith("Bearer "):
+        logger.error("Invalid Authentication")
+        return ERROR_HANDLER(1021)
+    
+    api_key = auth_header.split(" ")[1]
+    
+    # Определяем заголовки для запросов к API 1minAI
+    headers = {
+        "API-KEY": api_key, 
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream"
+    }
+    
     request_data = request.get_json()
     if 'messages' not in request_data or not isinstance(request_data['messages'], list):
         return ERROR_HANDLER(1400, detail="Missing messages field or not a list")
