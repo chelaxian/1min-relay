@@ -26,6 +26,9 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 import docx2txt
 from docx import Document as DocxDocument
+import io
+import sys
+from itertools import islice
 
 # Suppress warnings from flask_limiter
 warnings.filterwarnings("ignore", category=UserWarning, module="flask_limiter.extension")
@@ -848,49 +851,101 @@ def process_stt_request():
         except:
             pass
 
-def web_search(query, api_key, num_results=5):
+def web_search(query, api_key=None, num_results=5):
     """
-    Perform a web search using 1minAI API
+    Perform a web search using Google Search API with fallback to DuckDuckGo
     
     Args:
         query (str): Search query
-        api_key (str): API key
+        api_key (str): API key for Google Search
         num_results (int): Number of results to return (default: 5)
     
     Returns:
         dict: Search results
     """
-    headers = {"API-KEY": api_key}
-    payload = {
-        "query": query,
-        "numResults": min(max(num_results, 1), 10)  # Limit between 1-10
-    }
-    
     try:
-        logger.info(f"Performing web search for: {query}")
-        response = requests.post(ONE_MIN_SEARCH_URL, json=payload, headers=headers)
-        response.raise_for_status()
-        results = response.json()
+        # Try Google Search first
+        google_api_key = os.environ.get('GOOGLE_API_KEY')
+        google_cse_id = os.environ.get('GOOGLE_CSE_ID')
         
-        # Process and format the results
-        processed_results = {
-            "results": [],
+        if google_api_key and google_cse_id:
+            logger.info(f"Performing Google search for: {query}")
+            
+            url = "https://www.googleapis.com/customsearch/v1"
+            params = {
+                'q': query,
+                'key': google_api_key,
+                'cx': google_cse_id,
+                'num': min(num_results, 10)  # Google limits to 10 results
+            }
+            
+            response = requests.get(url, params=params)
+            response.raise_for_status()
+            results = response.json()
+            
+            formatted_results = []
+            for item in results.get('items', []):
+                formatted_results.append({
+                    "title": item.get('title', ''),
+                    "url": item.get('link', ''),
+                    "snippet": item.get('snippet', ''),
+                    "date": ''  # Google API doesn't provide dates
+                })
+            
+            logger.info(f"Google search returned {len(formatted_results)} results")
+            return {
+                "results": formatted_results,
+                "query": query
+            }
+        
+        # Fallback to DuckDuckGo if Google Search is not configured
+        logger.info("Google Search API keys not found, falling back to DuckDuckGo")
+        from duckduckgo_search import DDGS
+        
+        results = []
+        with DDGS() as ddgs:
+            ddgs_gen = ddgs.text(query, safesearch='Off', timelimit='y', backend="lite")
+            for r in islice(ddgs_gen, num_results):
+                results.append({
+                    "title": r.get('title', ''),
+                    "url": r.get('link', ''),
+                    "snippet": r.get('body', ''),
+                    "date": ''
+                })
+        
+        logger.info(f"DuckDuckGo search returned {len(results)} results")
+        return {
+            "results": results,
             "query": query
         }
         
-        for result in results.get('results', []):
-            # Extract relevant information and format consistently
-            processed_results['results'].append({
-                "title": result.get('title', ''),
-                "url": result.get('url', ''),
-                "snippet": result.get('snippet', ''),
-                "date": result.get('date', '')
-            })
-            
-        logger.info(f"Web search returned {len(processed_results['results'])} results")
-        return processed_results
-    except requests.exceptions.RequestException as e:
+    except Exception as e:
         logger.error(f"Web search error: {str(e)}")
+        # If Google Search fails, try DuckDuckGo as fallback
+        if google_api_key and google_cse_id:
+            logger.info("Google Search failed, trying DuckDuckGo as fallback")
+            try:
+                from duckduckgo_search import DDGS
+                
+                results = []
+                with DDGS() as ddgs:
+                    ddgs_gen = ddgs.text(query, safesearch='Off', timelimit='y', backend="lite")
+                    for r in islice(ddgs_gen, num_results):
+                        results.append({
+                            "title": r.get('title', ''),
+                            "url": r.get('link', ''),
+                            "snippet": r.get('body', ''),
+                            "date": ''
+                        })
+                
+                logger.info(f"DuckDuckGo fallback search returned {len(results)} results")
+                return {
+                    "results": results,
+                    "query": query
+                }
+            except Exception as ddg_e:
+                logger.error(f"DuckDuckGo fallback search error: {str(ddg_e)}")
+                
         return {"results": [], "query": query, "error": str(e)}
 
 @app.route('/v1/audio/transcriptions', methods=['POST', 'OPTIONS'])
@@ -1921,41 +1976,37 @@ def execute_python_code(code, timeout=10):
         dict: Execution result with stdout, stderr and execution status
     """
     try:
-        # Create a temporary file for the code
-        with tempfile.NamedTemporaryFile(suffix='.py', mode='w', delete=False) as temp_file:
-            temp_file_path = temp_file.name
-            temp_file.write(code)
+        # Create a string buffer to capture output
+        output = io.StringIO()
+        error = io.StringIO()
         
-        # Execute the code in a separate process with timeout
-        logger.debug(f"Executing Python code with {timeout}s timeout")
-        process = subprocess.Popen(
-            ['python', temp_file_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
+        # Redirect stdout and stderr
+        sys.stdout = output
+        sys.stderr = error
         
+        # Execute the code
         try:
-            stdout, stderr = process.communicate(timeout=timeout)
-            return {
-                "status": "success" if process.returncode == 0 else "error",
-                "stdout": stdout,
-                "stderr": stderr,
-                "return_code": process.returncode
+            exec(code, {'__builtins__': __builtins__}, {})
+            result = {
+                "status": "success",
+                "stdout": output.getvalue(),
+                "stderr": error.getvalue(),
+                "return_code": 0
             }
-        except subprocess.TimeoutExpired:
-            process.kill()
-            return {
-                "status": "timeout",
-                "stdout": "",
-                "stderr": f"Execution timed out after {timeout} seconds",
-                "return_code": -1
+        except Exception as e:
+            result = {
+                "status": "error",
+                "stdout": output.getvalue(),
+                "stderr": str(e),
+                "return_code": 1
             }
-        finally:
-            # Clean up the temporary file
-            if os.path.exists(temp_file_path):
-                os.unlink(temp_file_path)
-    
+        
+        # Restore stdout and stderr
+        sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
+        
+        return result
+        
     except Exception as e:
         logger.error(f"Error executing Python code: {str(e)}")
         return {
