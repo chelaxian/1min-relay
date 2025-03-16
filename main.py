@@ -1358,14 +1358,35 @@ def conversation():
                 })
     
     # Prepare 1minAI API request
+    # Convert all_messages to the right format for 1minAI API
+    processed_messages = []
+    for msg in all_messages:
+        if msg["role"] == "system":
+            # Skip system messages or handle them differently if needed
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            # Handle multi-part content (text + images)
+            text_parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text_parts.append(part.get("text", ""))
+            content = " ".join(text_parts)
+        processed_messages.append({
+            "role": msg["role"],
+            "content": content
+        })
+    
+    # Convert to JSON string for 1minAI API
+    conversation_str = json.dumps(processed_messages)
+    
     payload = {
-        "promptObject": {
-            "conversation": all_messages,
-            "truncation": "AUTO"
-        },
+        "type": "CHAT_WITH_AI",
         "model": model,
-        "conversation": {
-            "uuid": str(uuid.uuid4())
+        "promptObject": {
+            "prompt": conversation_str,
+            "isMixed": False,
+            "webSearch": False
         }
     }
     
@@ -1373,8 +1394,6 @@ def conversation():
     if has_image:
         payload["type"] = "CHAT_WITH_IMAGE"
         payload["promptObject"]["imageList"] = image_paths
-    else:
-        payload["type"] = "CHAT_WITH_AI"
     
     # Add tools if configured
     if tools_config:
