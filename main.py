@@ -581,14 +581,10 @@ def process_tools(tools, tool_choice, model):
         # 1minAI doesn't directly support this, but we can add this to the prompt
         pass
     
+    # ВАЖНО: Не включаем ссылки на функции в возвращаемый объект
     return {
         "tools": one_min_tools,
-        "autoInvoke": auto_invoke,
-        "handlers": {
-            "get_current_datetime": handle_get_datetime,
-            "execute_python": handle_execute_python,
-            "web_search": handle_web_search
-        }
+        "autoInvoke": auto_invoke
     }
 
 def handle_get_datetime(params):
@@ -1140,21 +1136,51 @@ def transform_streaming_response(data, request_data, last_output, prompt_tokens)
             choices.append(choice)
     
     # Check for function_call field
-    elif 'function_call' in data:
+    elif 'function_call' in data or 'tool_calls' in data:
         # Handle function call streaming
-        func_call = data['function_call']
-        if isinstance(func_call, dict):
+        if 'function_call' in data:
+            func_call = data['function_call']
             choice = {
                 "index": 0,
                 "delta": {
-                    "function_call": {
-                        "name": func_call.get('name', ''),
-                        "arguments": func_call.get('arguments', '')
-                    }
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": f"call_{uuid.uuid4()}",
+                            "type": "function",
+                            "function": {
+                                "name": func_call.get('name', ''),
+                                "arguments": func_call.get('arguments', '')
+                            }
+                        }
+                    ]
                 },
                 "finish_reason": None
             }
             choices.append(choice)
+        else:
+            # Handle tool_calls format
+            tool_calls = data.get('tool_calls', [])
+            if tool_calls:
+                for i, tool_call in enumerate(tool_calls):
+                    choice = {
+                        "index": i,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": i,
+                                    "id": f"call_{uuid.uuid4()}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": tool_call.get('function', {}).get('name', ''),
+                                        "arguments": tool_call.get('function', {}).get('arguments', '')
+                                    }
+                                }
+                            ]
+                        },
+                        "finish_reason": None
+                    }
+                    choices.append(choice)
     
     # Check for stop signal
     elif 'stop' in data and data['stop']:
@@ -1228,21 +1254,68 @@ def transform_response(one_min_response, request_data, prompt_tokens):
     # Extract content from 1minAI response
     content = one_min_response.get('content', '')
     
-    # Handle function calling if present
-    if 'function_call' in one_min_response:
-        function_call = one_min_response['function_call']
+    # Handle tool calls if present
+    if 'function_call' in one_min_response or 'tool_calls' in one_min_response:
+        # Extract function call data
+        function_call_data = one_min_response.get('function_call', one_min_response.get('tool_calls', [{}])[0])
+        function_name = function_call_data.get('name', '')
+        function_args = function_call_data.get('arguments', '{}')
+        
+        # Process the function call with appropriate handler
+        result = None
+        try:
+            if function_name == 'get_current_datetime':
+                # Parse arguments
+                args = json.loads(function_args) if isinstance(function_args, str) else function_args
+                result = handle_get_datetime(args)
+            elif function_name == 'execute_python':
+                args = json.loads(function_args) if isinstance(function_args, str) else function_args
+                result = handle_execute_python(args)
+            elif function_name == 'web_search':
+                args = json.loads(function_args) if isinstance(function_args, str) else function_args
+                result = handle_web_search(args)
+        except Exception as e:
+            logger.error(f"Error handling function call {function_name}: {str(e)}")
+            result = {"error": str(e)}
+        
+        # Format the OpenAI response to include both function call and function result
         choice = {
             "index": 0,
             "message": {
                 "role": "assistant",
                 "content": None,
-                "function_call": {
-                    "name": function_call.get('name', ''),
-                    "arguments": function_call.get('arguments', '{}')
-                }
+                "tool_calls": [
+                    {
+                        "id": f"call_{uuid.uuid4()}",
+                        "type": "function",
+                        "function": {
+                            "name": function_name,
+                            "arguments": function_args
+                        }
+                    }
+                ]
             },
-            "finish_reason": "function_call"
+            "finish_reason": "tool_call"
         }
+        
+        # If we successfully processed the function, add the result
+        if result:
+            # Create a follow-up message with the function result
+            transformed_response["choices"].append(choice)
+            
+            # Add a second choice with the function result
+            result_json = json.dumps(result)
+            choice2 = {
+                "index": 1,
+                "message": {
+                    "role": "tool",
+                    "tool_call_id": choice["message"]["tool_calls"][0]["id"],
+                    "name": function_name,
+                    "content": result_json
+                },
+                "finish_reason": "tool_result"
+            }
+            transformed_response["choices"].append(choice2)
     else:
         # Regular text response
         choice = {
@@ -1253,8 +1326,7 @@ def transform_response(one_min_response, request_data, prompt_tokens):
             },
             "finish_reason": "stop"
         }
-    
-    transformed_response["choices"].append(choice)
+        transformed_response["choices"].append(choice)
     
     # Calculate completion tokens
     completion_tokens = calculate_token(content, request_data.get('model', 'DEFAULT'))
