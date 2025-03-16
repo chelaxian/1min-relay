@@ -1261,13 +1261,215 @@ def audio_transcriptions():
     if model == 'whisper-1':
         # Если пользователь выбрал whisper-1, используем gpt-4o-mini для ответа
         logger.info("whisper-1 используется только для транскрипции; для генерации ответов будет использован gpt-4o-mini")
-        
+    
+    # Получаем API ключ
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith("Bearer "):
+        logger.error("Missing or invalid authorization header")
+        return ERROR_HANDLER(1021)
+    
+    api_key = auth_header.split(" ")[1]
+    
+    # Проверяем наличие файла
+    if 'file' not in request.files:
+        logger.error("No audio file in request")
+        return ERROR_HANDLER(1700, detail="No audio file provided")
+    
+    audio_file = request.files['file']
+    
+    # Получаем модель из запроса (которая будет обрабатывать транскрибированный текст)
+    original_model = request.form.get('model', 'gpt-4o-mini')
+    logger.info(f"Original model requested: {original_model}")
+    logger.info(f"Processing audio file: {audio_file.filename} with whisper-1 for transcription")
+    
+    # Создаем временный файл
+    temp_file = tempfile.NamedTemporaryFile(delete=False)
+    temp_file_path = temp_file.name
+    audio_file.save(temp_file_path)
+    logger.debug(f"Saved audio file temporarily at: {temp_file_path}")
+    
     try:
-        return process_stt_request()
+        # Загружаем файл в 1minAI
+        headers = {"API-KEY": api_key}
+        files = {'asset': (audio_file.filename, open(temp_file_path, 'rb'), audio_file.content_type)}
+        
+        logger.info(f"Uploading audio file to 1minAI asset URL: {ONE_MIN_ASSET_URL}")
+        asset_response = requests.post(ONE_MIN_ASSET_URL, files=files, headers=headers)
+        asset_response.raise_for_status()
+        
+        # Получаем путь к аудио
+        asset_data = asset_response.json()
+        logger.debug(f"Asset response: {json.dumps(asset_data)[:200]}...")
+        audio_path = asset_data['fileContent']['path']
+        logger.info(f"Audio file uploaded successfully. Path: {audio_path}")
+        
+        # Отправляем запрос на транскрипцию с моделью whisper-1
+        stt_payload = {
+            "type": "SPEECH_TO_TEXT",
+            "model": "whisper-1",
+            "promptObject": {
+                "audioUrl": audio_path,
+                "response_format": "text"
+            }
+        }
+        
+        # Заголовки для запроса транскрипции
+        headers = {
+            "API-KEY": api_key,
+            "Content-Type": "application/json"
+        }
+        
+        # Отправляем запрос на транскрипцию
+        logger.info(f"Sending transcription request to: {ONE_MIN_API_URL}")
+        logger.debug(f"Transcription payload: {json.dumps(stt_payload)}")
+        
+        stt_response = requests.post(ONE_MIN_API_URL, json=stt_payload, headers=headers)
+        logger.debug(f"Speech-to-text response status: {stt_response.status_code}")
+        logger.debug(f"Speech-to-text response headers: {stt_response.headers}")
+        logger.debug(f"Speech-to-text response body: {stt_response.text[:1000]}...")
+        
+        stt_response.raise_for_status()
+        stt_data = stt_response.json()
+        
+        # Извлекаем текст из ответа
+        transcription = ""
+        
+        if "aiRecord" in stt_data and "aiRecordDetail" in stt_data["aiRecord"]:
+            details = stt_data["aiRecord"]["aiRecordDetail"]
+            
+            if "resultObject" in details:
+                result_obj = details["resultObject"]
+                if isinstance(result_obj, list) and result_obj:
+                    transcription = "".join(result_obj)
+                elif isinstance(result_obj, str):
+                    transcription = result_obj
+                elif isinstance(result_obj, dict):
+                    for field in ["text", "transcript", "result"]:
+                        if field in result_obj and result_obj[field]:
+                            transcription = result_obj[field]
+                            break
+        
+        if not transcription:
+            logger.warning(f"Cannot extract transcription from response: {json.dumps(stt_data)[:200]}...")
+            transcription = "Не удалось распознать текст в аудио"
+        
+        logger.info(f"Transcription successful: {transcription}")
+        
+        # Проверяем, не используется ли whisper-1 как модель для ответа
+        if original_model == "whisper-1":
+            logger.warning("Whisper-1 не может использоваться для генерации ответов. Используем gpt-4o-mini вместо этого.")
+            original_model = "gpt-4o-mini"
+        
+        # Отправляем транскрибированный текст на обработку в модель
+        logger.info(f"Forwarding transcribed text to original model: {original_model}")
+        
+        # Получаем дополнительные параметры из запроса
+        temperature = float(request.form.get('temperature', 0.7))
+        top_p = float(request.form.get('top_p', 1.0))
+        
+        # Проверяем, поддерживает ли модель веб-поиск
+        use_web_search = original_model in web_search_supported_models
+        
+        # Формируем запрос к API 1minAI для получения ответа на транскрибированный текст
+        chat_payload = {
+            "type": "CHAT_WITH_AI",
+            "model": original_model,
+            "promptObject": {
+                "prompt": transcription,
+                "isMixed": False,
+                "webSearch": use_web_search
+            },
+            "temperature": temperature,
+            "top_p": top_p
+        }
+        
+        # Отправляем запрос для получения ответа
+        logger.debug(f"Sending request to {ONE_MIN_API_URL} with payload: {json.dumps(chat_payload)[:200]}...")
+        
+        chat_response = requests.post(ONE_MIN_API_URL, json=chat_payload, headers=headers)
+        chat_response.raise_for_status()
+        
+        # Получаем ответ
+        chat_data = chat_response.json()
+        logger.debug(f"Received response: {json.dumps(chat_data)[:200]}...")
+        
+        # Извлекаем текст ответа из разных возможных мест в JSON
+        content = ""
+        
+        # Вариант 1: прямое поле content в корне ответа
+        if "content" in chat_data:
+            content = chat_data.get('content', '')
+        
+        # Вариант 2: поле в aiRecord
+        if not content and "aiRecord" in chat_data:
+            ai_record = chat_data["aiRecord"]
+            
+            if "aiRecordDetail" in ai_record:
+                details = ai_record["aiRecordDetail"]
+                
+                if "resultObject" in details:
+                    result_obj = details["resultObject"]
+                    if isinstance(result_obj, list) and result_obj:
+                        content = "".join(result_obj)
+                    elif isinstance(result_obj, str):
+                        content = result_obj
+                    elif isinstance(result_obj, dict):
+                        for field in ["text", "content", "message", "response"]:
+                            if field in result_obj and result_obj[field]:
+                                content = result_obj[field]
+                                break
+        
+        if not content:
+            logger.warning(f"Empty content in response: {json.dumps(chat_data)[:200]}...")
+            content = "Я не смог обработать ваш запрос. Пожалуйста, попробуйте еще раз."
+        
+        logger.info(f"Extracted content from response: {content[:100]}...")
+        
+        # Создаем ответ в формате OpenAI API
+        completion_id = f"chatcmpl-{uuid.uuid4()}"
+        prompt_tokens = len(transcription.split())
+        completion_tokens = len(content.split())
+        
+        openai_response = {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": original_model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": content
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens
+            }
+        }
+        
+        logger.debug(f"Successfully processed audio response with {completion_tokens} tokens")
+        logger.debug(f"Returning OpenAI format response: {json.dumps(openai_response)[:200]}...")
+        
+        # Возвращаем ответ в формате OpenAI API
+        return jsonify(openai_response)
+    
     except Exception as e:
-        logger.error(f"Error in audio_transcriptions endpoint: {str(e)}")
+        logger.error(f"Error in audio processing: {str(e)}")
         logger.error(traceback.format_exc())
-        return ERROR_HANDLER(1500, detail=f"Error processing audio: {str(e)}")
+        return ERROR_HANDLER(1500, detail=str(e))
+    
+    finally:
+        # Удаляем временный файл
+        try:
+            os.unlink(temp_file_path)
+        except Exception as e:
+            logger.warning(f"Failed to delete temporary file: {str(e)}")
+            pass
 
 @app.route('/v1/audio/speech', methods=['POST', 'OPTIONS'])
 @limiter.limit("500 per minute")
