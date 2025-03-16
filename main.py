@@ -992,7 +992,7 @@ def process_stt_request():
         # Add additional parameters
         payload["temperature"] = temperature
         payload["top_p"] = top_p
-            
+        
         # Create API URL based on streaming or not
         api_url = ONE_MIN_CONVERSATION_API_STREAMING_URL if streaming else ONE_MIN_API_URL
         
@@ -1000,6 +1000,9 @@ def process_stt_request():
         logger.debug(f"Sending request to {api_url} with payload: {json.dumps(payload)[:200]}...")
         
         def generate():
+            # Захватываем значение streaming из внешней области видимости
+            is_streaming = False  # Всегда используем неитеративный подход для голосовых сообщений
+            
             # Set up headers for the API request
             headers = {
                 "API-KEY": api_key,
@@ -1008,163 +1011,81 @@ def process_stt_request():
             }
             
             try:
-                if streaming:
-                    # Потоковая обработка (для чата), используем код из предыдущей версии
-                    # с обработкой потоковых данных
-                    try:
-                        with requests.post(api_url, json=payload, headers=headers, stream=streaming) as response:
-                            response.raise_for_status()
-                            
-                            # Process streaming response
-                            prompt_tokens = len(transcription.split())
-                            total_completion_tokens = 0
-                            
-                            # Yield the initial chunk
-                            initial_response = transform_streaming_chunk({}, messages, original_model)
-                            yield f"data: {json.dumps(initial_response)}\n\n"
-                            
-                            # Process each chunk in the streaming response
-                            for line in response.iter_lines():
-                                if line:
-                                    try:
-                                        # Try to parse the line as JSON
-                                        line_str = line.decode('utf-8')
-                                        # Проверяем, не пустая ли строка и является ли она JSON
-                                        if not line_str.strip():
-                                            logger.debug("Получена пустая строка в потоковом ответе, пропускаем")
-                                            continue
-                                            
-                                        if line_str.startswith('data: '):
-                                            # Удаляем префикс 'data: ' из строки
-                                            data_str = line_str[6:]
-                                            if data_str == '[DONE]':
-                                                logger.debug("Получено завершение потока [DONE]")
-                                                continue
-                                            try:
-                                                data = json.loads(data_str)
-                                            except json.JSONDecodeError:
-                                                logger.warning(f"Некорректный JSON в потоковом ответе: {data_str[:50]}...")
-                                                continue
-                                        else:
-                                            try:
-                                                data = json.loads(line_str)
-                                            except json.JSONDecodeError:
-                                                logger.warning(f"Некорректный JSON в потоковом ответе: {line_str[:50]}...")
-                                                continue
-                                        
-                                        transformed_chunk = transform_streaming_chunk(data, messages, original_model)
-                                        yield f"data: {json.dumps(transformed_chunk)}\n\n"
-                                        
-                                        # Count tokens for debugging
-                                        if 'content' in data:
-                                            total_completion_tokens += len(data['content'].split())
-                                    except Exception as e:
-                                        logger.error(f"Error processing streaming chunk: {str(e)}, chunk: {line[:100] if line else 'empty'}")
-                                        # Send error info to client
-                                        error_chunk = {
-                                            "id": f"chatcmpl-{uuid.uuid4()}",
-                                            "object": "chat.completion.chunk",
-                                            "created": int(time.time()),
-                                            "model": original_model,
-                                            "choices": [
-                                                {
-                                                    "index": 0,
-                                                    "delta": {"content": f"\nОшибка обработки фрагмента: {str(e)}"},
-                                                    "finish_reason": "error"
-                                                }
-                                            ]
-                                        }
-                                        yield f"data: {json.dumps(error_chunk)}\n\n"
-                            
-                            # Send the final [DONE] marker
-                            yield "data: [DONE]\n\n"
-                            
-                            # Log completion for debugging
-                            logger.debug(f"Finished processing streaming response. Completion tokens: {total_completion_tokens}")
-                            logger.debug(f"Total tokens: {prompt_tokens + total_completion_tokens}")
-                    except Exception as streaming_e:
-                        logger.error(f"Error in streaming response: {str(streaming_e)}")
-                        # Fallback to non-streaming if streaming fails
-                        logger.warning(f"Streaming failed, falling back to non-streaming mode")
-                        streaming = False
-                        api_url = ONE_MIN_API_URL
-                
-                # Если streaming=False, используем неитеративный подход - проще и надежнее для аудио
-                if not streaming:
-                    logger.info(f"Using non-streaming approach for audio response with model {original_model}")
-                    try:
-                        response = requests.post(api_url, json=payload, headers=headers)
-                        response.raise_for_status()
-                        
-                        # Get the response
-                        response_data = response.json()
-                        logger.debug(f"Received non-streaming response: {json.dumps(response_data)[:200]}...")
-                        
-                        # Get the content from the response
-                        content = response_data.get('content', '')
-                        if not content:
-                            logger.warning(f"Empty content in response: {json.dumps(response_data)[:200]}...")
-                            content = "Я не смог обработать ваш запрос. Пожалуйста, попробуйте еще раз."
-                        
-                        # Create completion response
-                        completion_id = f"chatcmpl-{uuid.uuid4()}"
-                        prompt_tokens = len(transcription.split())
-                        completion_tokens = len(content.split())
-                        
-                        # Create OpenAI-compatible response
-                        completion_response = {
-                            "id": completion_id,
-                            "object": "chat.completion",
-                            "created": int(time.time()),
-                            "model": original_model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "message": {
-                                        "role": "assistant",
-                                        "content": content
-                                    },
-                                    "finish_reason": "stop"
-                                }
-                            ],
-                            "usage": {
-                                "prompt_tokens": prompt_tokens,
-                                "completion_tokens": completion_tokens,
-                                "total_tokens": prompt_tokens + completion_tokens
+                # Используем неитеративный подход
+                logger.info(f"Using non-streaming approach for audio response with model {original_model}")
+                try:
+                    response = requests.post(api_url, json=payload, headers=headers)
+                    response.raise_for_status()
+                    
+                    # Get the response
+                    response_data = response.json()
+                    logger.debug(f"Received non-streaming response: {json.dumps(response_data)[:200]}...")
+                    
+                    # Get the content from the response
+                    content = response_data.get('content', '')
+                    if not content:
+                        logger.warning(f"Empty content in response: {json.dumps(response_data)[:200]}...")
+                        content = "Я не смог обработать ваш запрос. Пожалуйста, попробуйте еще раз."
+                    
+                    # Create completion response
+                    completion_id = f"chatcmpl-{uuid.uuid4()}"
+                    prompt_tokens = len(transcription.split())
+                    completion_tokens = len(content.split())
+                    
+                    # Create OpenAI-compatible response
+                    completion_response = {
+                        "id": completion_id,
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": original_model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": content
+                                },
+                                "finish_reason": "stop"
                             }
+                        ],
+                        "usage": {
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": prompt_tokens + completion_tokens
                         }
-                        
-                        # Format as streaming response for consistency
-                        yield f"data: {json.dumps(completion_response)}\n\n"
-                        yield "data: [DONE]\n\n"
-                        
-                        logger.debug(f"Successfully processed audio response with {completion_tokens} tokens")
-                        
-                    except requests.exceptions.HTTPError as e:
-                        logger.error(f"HTTP error in non-streaming request: {str(e)}")
-                        error_response = {
-                            "id": f"chatcmpl-{uuid.uuid4()}",
-                            "object": "chat.completion",
-                            "created": int(time.time()),
-                            "model": original_model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "message": {
-                                        "role": "assistant",
-                                        "content": f"Произошла ошибка при обработке запроса: {str(e)}"
-                                    },
-                                    "finish_reason": "error"
-                                }
-                            ],
-                            "usage": {
-                                "prompt_tokens": len(transcription.split()),
-                                "completion_tokens": 20,
-                                "total_tokens": len(transcription.split()) + 20
+                    }
+                    
+                    # Format as streaming response for consistency
+                    yield f"data: {json.dumps(completion_response)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    
+                    logger.debug(f"Successfully processed audio response with {completion_tokens} tokens")
+                    
+                except requests.exceptions.HTTPError as e:
+                    logger.error(f"HTTP error in non-streaming request: {str(e)}")
+                    error_response = {
+                        "id": f"chatcmpl-{uuid.uuid4()}",
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": original_model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": f"Произошла ошибка при обработке запроса: {str(e)}"
+                                },
+                                "finish_reason": "error"
                             }
+                        ],
+                        "usage": {
+                            "prompt_tokens": len(transcription.split()),
+                            "completion_tokens": 20,
+                            "total_tokens": len(transcription.split()) + 20
                         }
-                        yield f"data: {json.dumps(error_response)}\n\n"
-                        yield "data: [DONE]\n\n"
+                    }
+                    yield f"data: {json.dumps(error_response)}\n\n"
+                    yield "data: [DONE]\n\n"
             
             except Exception as e:
                 logger.error(f"General error in generate function: {str(e)}")
