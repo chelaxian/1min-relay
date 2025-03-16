@@ -177,13 +177,7 @@ ALL_ONE_MIN_AVAILABLE_MODELS = [
 vision_supported_models = [
     "gpt-4o",
     "gpt-4o-mini",
-    "gpt-4-turbo",
-    "claude-3-5-sonnet-20240620",
-    "claude-3-opus-20240229",
-    "claude-3-sonnet-20240229",
-    "claude-3-haiku-20240307",
-    "gemini-1.5-pro",
-    "gemini-1.5-flash"
+    "gpt-4-turbo"
 ]
 
 # Define models that support tool use (function calling)
@@ -1170,7 +1164,6 @@ def audio_speech():
     # request_data = request.json
     # return process_tts_request(request_data)
 
-@app.route('/v1/chat/completions', methods=['POST', 'OPTIONS'])
 @limiter.limit("500 per minute")
 def process_user_input(messages):
     """
@@ -1264,6 +1257,9 @@ def process_user_input(messages):
         user_input = content
     
     return user_input, image_paths, has_image
+
+@app.route('/v1/chat/completions', methods=['POST', 'OPTIONS'])
+@limiter.limit("500 per minute")
 def conversation():
     """
     Main endpoint for the OpenAI-compatible API conversation
