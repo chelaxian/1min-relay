@@ -888,11 +888,26 @@ def process_stt_request():
         if "aiRecord" in response_data and "aiRecordDetail" in response_data["aiRecord"]:
             details = response_data["aiRecord"]["aiRecordDetail"]
             
-            # Ищем в известных полях
-            for field in ["text", "transcript", "result"]:
-                if field in details and details[field]:
-                    transcription = details[field]
-                    break
+            # Сначала проверяем resultObject, который может содержать массив строк
+            if "resultObject" in details:
+                result_obj = details["resultObject"]
+                if isinstance(result_obj, list) and result_obj:
+                    # Объединяем все строки из массива
+                    transcription = "".join(result_obj)
+                elif isinstance(result_obj, str):
+                    transcription = result_obj
+                elif isinstance(result_obj, dict) and any(field in result_obj for field in ["text", "transcript", "result"]):
+                    for field in ["text", "transcript", "result"]:
+                        if field in result_obj and result_obj[field]:
+                            transcription = result_obj[field]
+                            break
+            
+            # Если не нашли в resultObject, ищем в других известных полях
+            if not transcription:
+                for field in ["text", "transcript", "result"]:
+                    if field in details and details[field]:
+                        transcription = details[field]
+                        break
             
             # Если не нашли, ищем в promptObject
             if not transcription and "promptObject" in details:
@@ -903,10 +918,23 @@ def process_stt_request():
         
         # Если все еще не нашли, ищем в корне ответа
         if not transcription:
-            for field in ["text", "transcript", "result"]:
-                if field in response_data and response_data[field]:
-                    transcription = response_data[field]
-                    break
+            # Проверяем resultObject в корне ответа
+            if "resultObject" in response_data:
+                result_obj = response_data["resultObject"]
+                if isinstance(result_obj, list) and result_obj:
+                    transcription = "".join(result_obj)
+                elif isinstance(result_obj, str):
+                    transcription = result_obj
+            
+            # Ищем в других полях корня
+            if not transcription:
+                for field in ["text", "transcript", "result"]:
+                    if field in response_data and response_data[field]:
+                        transcription = response_data[field]
+                        break
+        
+        # Логируем детали для отладки
+        logger.debug(f"Результат поиска транскрипции: {transcription[:100] if transcription else 'не найдено'}")
         
         # Если не нашли текст нигде, используем дефолтное сообщение
         if not transcription:
