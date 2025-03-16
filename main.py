@@ -21,6 +21,11 @@ import printedcolors
 import base64
 import tempfile
 import re
+import datetime
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
+import docx2txt
+from docx import Document as DocxDocument
 
 # Suppress warnings from flask_limiter
 warnings.filterwarnings("ignore", category=UserWarning, module="flask_limiter.extension")
@@ -370,6 +375,7 @@ def extract_images_from_message(messages, api_key, model):
     image = False
     image_paths = []
     user_input = ""
+    has_ignored_images = False
     
     if not messages:
         return user_input, image_paths, image
@@ -395,8 +401,9 @@ def extract_images_from_message(messages, api_key, model):
         try:
             if 'image_url' in item:
                 if model not in vision_supported_models:
-                    # If the model doesn't support images, just ignore them and log the warning message
-                    logger.warning(f"Model {model} does not support image inputs, ignoring images")
+                    # If model doesn't support images, ignore them and log warning
+                    has_ignored_images = True
+                    logger.warning(f"Model {model} does not support images in 1minAI API. Images will be ignored.")
                     continue
                 
                 # Process base64 images
@@ -420,8 +427,19 @@ def extract_images_from_message(messages, api_key, model):
                     
                     # Upload to 1minAI
                     headers = {"API-KEY": api_key}
+                    
+                    # Add a detail parameter for better image analysis of people
+                    if 'detail' in item and item['detail'] == 'high':
+                        # High detail for photos with people or complex scenes
+                        detail_level = "high"
+                    else:
+                        detail_level = "auto"
+                    
+                    # Generate a unique filename
+                    image_filename = f"relay_image_{uuid.uuid4()}.{mime_type.split('/')[-1]}"
+                    
                     files = {
-                        'asset': (f"relay_{uuid.uuid4()}", image_data, mime_type)
+                        'asset': (image_filename, image_data, mime_type)
                     }
                     
                     asset_response = requests.post(ONE_MIN_ASSET_URL, files=files, headers=headers)
@@ -431,12 +449,28 @@ def extract_images_from_message(messages, api_key, model):
                     image_path = asset_response.json()['fileContent']['path']
                     image_paths.append(image_path)
                     image = True
+                    
+                    # For models that need specific guidance on image analysis
+                    if 'claude' in model and not any(text in item.get('text', '') for text in ["describe", "what do you see", "analyze", "explain"]):
+                        # Add image analysis instructions for Claude models to improve recognition of people
+                        analysis_prompts = [
+                            "Describe this image in detail. If there are people in the image, describe them. If there is text in the image, read it.",
+                            "What do you see in this image? Please describe all elements, including any people, objects, text, and scenery."
+                        ]
+                        
+                        # Add the prompt to the text part only if no other text was provided
+                        if not text_parts:
+                            text_parts.append(analysis_prompts[0])
         except Exception as e:
             logger.error(f"Error processing image: {str(e)[:100]}")
             # Continue to process other content even if one image fails
     
     # Combine all text parts
     user_input = '\n'.join(text_parts)
+    
+    # If images were ignored, add a warning to the beginning of the message
+    if has_ignored_images:
+        user_input = f"Note: This model cannot process images. Please use one of these models instead: {', '.join(vision_supported_models[:3])} and others.\n\n{user_input}"
     
     return user_input, image_paths, image
 
@@ -453,10 +487,74 @@ def process_tools(tools, tool_choice, model):
         dict: 1minAI compatible tools configuration
     """
     if not tools:
-        return None
-    
-    if model not in tools_supported_models:
-        # If the model does not support tools, just return None instead of calling an error
+        # Add default tools for supported models
+        if model in tools_supported_models:
+            # Default tools for all supported models
+            default_tools = [
+                {
+                    "name": "get_current_datetime",
+                    "description": "Get the current date and time in various formats",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "format": {
+                                "type": "string",
+                                "description": "Date format (default: ISO format). Options: iso, rfc, human, unix"
+                            },
+                            "timezone": {
+                                "type": "string",
+                                "description": "Timezone (default: UTC). Example: Europe/London, America/New_York"
+                            }
+                        },
+                        "required": []
+                    }
+                },
+                {
+                    "name": "execute_python",
+                    "description": "Execute Python code and return the result",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "code": {
+                                "type": "string",
+                                "description": "Python code to execute"
+                            },
+                            "timeout": {
+                                "type": "integer",
+                                "description": "Maximum execution time in seconds (default: 10)"
+                            }
+                        },
+                        "required": ["code"]
+                    }
+                },
+                {
+                    "name": "web_search",
+                    "description": "Search the web for information",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Search query"
+                            },
+                            "num_results": {
+                                "type": "integer",
+                                "description": "Number of results to return (default: 5)"
+                            }
+                        },
+                        "required": ["query"]
+                    }
+                }
+            ]
+            
+            # Combine with any user-provided tools
+            tools = tools + default_tools if tools else default_tools
+        else:
+            # If the model does not support tools, just return None
+            logger.warning(f"Model {model} does not support tool use, ignoring tools parameter")
+            return None
+    elif model not in tools_supported_models:
+        # If the model does not support tools, just return None
         logger.warning(f"Model {model} does not support tool use, ignoring tools parameter")
         return None
     
@@ -465,8 +563,8 @@ def process_tools(tools, tool_choice, model):
     
     for tool in tools:
         # Currently only 'function' type is supported
-        if tool.get('type') == 'function':
-            function_def = tool.get('function', {})
+        if tool.get('type', 'function') == 'function':
+            function_def = tool.get('function', tool)  # Handle both formats
             one_min_tool = {
                 "name": function_def.get('name', ''),
                 "description": function_def.get('description', ''),
@@ -485,8 +583,149 @@ def process_tools(tools, tool_choice, model):
     
     return {
         "tools": one_min_tools,
-        "autoInvoke": auto_invoke
+        "autoInvoke": auto_invoke,
+        "handlers": {
+            "get_current_datetime": handle_get_datetime,
+            "execute_python": handle_execute_python,
+            "web_search": handle_web_search
+        }
     }
+
+def handle_get_datetime(params):
+    """
+    Handle the get_current_datetime tool call
+    
+    Args:
+        params (dict): Tool parameters
+    
+    Returns:
+        dict: Tool response
+    """
+    try:
+        # Get parameters with defaults
+        format_type = params.get('format', 'iso').lower()
+        timezone_str = params.get('timezone', 'UTC')
+        
+        # Import tz handling if timezone is specified
+        if timezone_str != 'UTC':
+            try:
+                from dateutil import tz
+                timezone = tz.gettz(timezone_str)
+                if not timezone:
+                    timezone = tz.UTC
+            except ImportError:
+                timezone = None
+                timezone_str = 'UTC'
+        else:
+            timezone = None
+        
+        # Get current datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+        
+        # Apply timezone if specified
+        if timezone:
+            now = now.astimezone(timezone)
+        
+        # Format according to requested format
+        if format_type == 'iso':
+            formatted_date = now.isoformat()
+        elif format_type == 'rfc':
+            formatted_date = now.strftime('%a, %d %b %Y %H:%M:%S %z')
+        elif format_type == 'human':
+            formatted_date = now.strftime('%A, %B %d, %Y %I:%M:%S %p %Z')
+        elif format_type == 'unix':
+            formatted_date = str(int(now.timestamp()))
+        else:
+            # Default to ISO
+            formatted_date = now.isoformat()
+        
+        return {
+            "datetime": formatted_date,
+            "timezone": timezone_str,
+            "format": format_type,
+            "year": now.year,
+            "month": now.month,
+            "day": now.day,
+            "hour": now.hour,
+            "minute": now.minute,
+            "second": now.second,
+            "weekday": now.strftime('%A')
+        }
+    except Exception as e:
+        logger.error(f"Error handling datetime tool: {str(e)}")
+        return {"error": str(e)}
+
+def handle_execute_python(params):
+    """
+    Handle the execute_python tool call
+    
+    Args:
+        params (dict): Tool parameters
+    
+    Returns:
+        dict: Tool response
+    """
+    try:
+        code = params.get('code', '')
+        timeout = int(params.get('timeout', 10))
+        
+        # Limit timeout to reasonable values
+        if timeout < 1:
+            timeout = 1
+        elif timeout > 30:
+            timeout = 30
+        
+        if not code:
+            return {"error": "No code provided"}
+        
+        # Execute the code
+        result = execute_python_code(code, timeout)
+        return result
+    except Exception as e:
+        logger.error(f"Error handling execute_python tool: {str(e)}")
+        return {"error": str(e)}
+
+def handle_web_search(params):
+    """
+    Handle the web_search tool call
+    
+    Args:
+        params (dict): Tool parameters
+    
+    Returns:
+        dict: Tool response
+    """
+    try:
+        query = params.get('query', '')
+        if not query:
+            return {"error": "No search query provided"}
+        
+        # Extract API key from request
+        api_key = extract_api_key()
+        if not api_key:
+            return {"error": "API key not found"}
+        
+        # Perform web search
+        search_results = web_search(query, api_key)
+        
+        # Format results
+        formatted_results = []
+        for result in search_results.get('results', []):
+            formatted_results.append({
+                "title": result.get('title', ''),
+                "url": result.get('url', ''),
+                "snippet": result.get('snippet', ''),
+                "date": result.get('date', '')
+            })
+        
+        return {
+            "query": query,
+            "results": formatted_results,
+            "total_results": len(formatted_results)
+        }
+    except Exception as e:
+        logger.error(f"Error handling web_search tool: {str(e)}")
+        return {"error": str(e)}
 
 def process_tts_request(request_data):
     """
@@ -613,29 +852,50 @@ def process_stt_request():
         except:
             pass
 
-def web_search(query, api_key):
+def web_search(query, api_key, num_results=5):
     """
     Perform a web search using 1minAI API
     
     Args:
         query (str): Search query
         api_key (str): API key
+        num_results (int): Number of results to return (default: 5)
     
     Returns:
         dict: Search results
     """
     headers = {"API-KEY": api_key}
     payload = {
-        "query": query
+        "query": query,
+        "numResults": min(max(num_results, 1), 10)  # Limit between 1-10
     }
     
     try:
+        logger.info(f"Performing web search for: {query}")
         response = requests.post(ONE_MIN_SEARCH_URL, json=payload, headers=headers)
         response.raise_for_status()
-        return response.json()
+        results = response.json()
+        
+        # Process and format the results
+        processed_results = {
+            "results": [],
+            "query": query
+        }
+        
+        for result in results.get('results', []):
+            # Extract relevant information and format consistently
+            processed_results['results'].append({
+                "title": result.get('title', ''),
+                "url": result.get('url', ''),
+                "snippet": result.get('snippet', ''),
+                "date": result.get('date', '')
+            })
+            
+        logger.info(f"Web search returned {len(processed_results['results'])} results")
+        return processed_results
     except requests.exceptions.RequestException as e:
         logger.error(f"Web search error: {str(e)}")
-        return {"results": []}
+        return {"results": [], "query": query, "error": str(e)}
 
 @app.route('/v1/audio/transcriptions', methods=['POST', 'OPTIONS'])
 @limiter.limit("500 per minute")
@@ -1335,6 +1595,98 @@ def files():
             file = request.files['file']
             purpose = request.form.get('purpose', 'assistants')
             
+            # Check if filename is empty
+            if file.filename == '':
+                return ERROR_HANDLER(1700, detail="Empty filename")
+
+            try:
+                # Check file type - support PDF, TXT, MD, DOCX
+                allowed_mime_types = ['application/pdf', 'text/plain', 'text/markdown', 
+                                     'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                                     'application/msword']
+                
+                # Read file content
+                file_content = file.read()
+                file.seek(0)  # Reset file pointer
+                
+                # Determine MIME type
+                mime_type = file.content_type
+                file_ext = os.path.splitext(file.filename)[1].lower()
+                
+                # Additional checks for text files
+                if not mime_type or mime_type == 'application/octet-stream':
+                    if file_ext in ['.txt', '.md', '.markdown']:
+                        mime_type = 'text/plain'
+                    elif file_ext == '.pdf':
+                        mime_type = 'application/pdf'
+                    elif file_ext == '.docx':
+                        mime_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+                    elif file_ext == '.doc':
+                        mime_type = 'application/msword'
+                
+                if mime_type not in allowed_mime_types:
+                    return ERROR_HANDLER(1700, detail=f"Unsupported file type: {mime_type}")
+                
+                # Process DOC/DOCX files
+                if mime_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' or mime_type == 'application/msword':
+                    logger.debug(f"Processing DOCX/DOC file: {file.filename}")
+                    
+                    # Save temporarily
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
+                        temp_file_path = temp_file.name
+                        temp_file.write(file_content)
+                    
+                    try:
+                        # Extract text
+                        if file_ext == '.docx':
+                            # Use docx2txt for DOCX
+                            text_content = docx2txt.process(temp_file_path)
+                        else:
+                            # Use python-docx for DOC (with conversion limitations)
+                            try:
+                                doc = DocxDocument(temp_file_path)
+                                text_content = "\n".join([para.text for para in doc.paragraphs])
+                            except Exception as doc_err:
+                                logger.error(f"Error processing DOC file with python-docx: {str(doc_err)}")
+                                text_content = "Error extracting text from DOC file. Please convert to DOCX or PDF format."
+                        
+                        # Create a text file with the extracted content
+                        text_filename = os.path.splitext(file.filename)[0] + ".txt"
+                        text_file_io = BytesIO(text_content.encode('utf-8'))
+                        
+                        # Upload the text file instead
+                        logger.debug(f"Uploading converted text file: {text_filename}")
+                        upload_result = upload_file_to_1min(text_file_io, text_filename, 'text/plain', api_key)
+                    finally:
+                        # Clean up
+                        if os.path.exists(temp_file_path):
+                            os.unlink(temp_file_path)
+                else:
+                    # Process other file types directly
+                    file_io = BytesIO(file_content)
+                    upload_result = upload_file_to_1min(file_io, file.filename, mime_type, api_key)
+                
+                # Format response in OpenAI format
+                transformed_response = {
+                    "id": upload_result['id'],
+                    "object": "file",
+                    "bytes": len(file_content),
+                    "created_at": int(time.time()),
+                    "filename": upload_result['name'],
+                    "purpose": purpose,
+                    "status": "processed"
+                }
+                
+                flask_response = make_response(jsonify(transformed_response))
+                set_response_headers(flask_response)
+                
+                return flask_response, 200
+            
+            except Exception as file_error:
+                logger.error(f"Error processing file: {str(file_error)}")
+                return ERROR_HANDLER(1700, detail=f"Error processing file: {str(file_error)}")
+            
+            # Legacy code path (should not be reached)
             # Prepare multipart form data
             files = {
                 'file': (file.filename, file.stream, file.content_type)
@@ -1426,6 +1778,136 @@ def stream_response(response, request_data, model, prompt_tokens):
     }
     yield f"data: {json.dumps(final_chunk)}\n\n"
     yield "data: [DONE]\n\n"
+
+def upload_file_to_1min(file_data, file_name, mime_type, api_key):
+    """
+    Upload a file to 1minAI via Asset API
+    
+    Args:
+        file_data (BytesIO): File data
+        file_name (str): File name
+        mime_type (str): File MIME type
+        api_key (str): API key
+    
+    Returns:
+        dict: Upload result with file ID and path
+    """
+    try:
+        headers = {"API-KEY": api_key}
+        files = {
+            'asset': (file_name, file_data, mime_type)
+        }
+        
+        logger.debug(f"Uploading file {file_name} to 1minAI")
+        response = requests.post(ONE_MIN_ASSET_URL, files=files, headers=headers)
+        response.raise_for_status()
+        
+        result = response.json()
+        logger.debug(f"File successfully uploaded, ID: {result['fileContent']['uuid']}")
+        
+        return {
+            "id": result['fileContent']['uuid'],
+            "path": result['fileContent']['path'],
+            "type": result['fileContent']['type'],
+            "name": result['fileContent']['name']
+        }
+    except Exception as e:
+        logger.error(f"Error uploading file: {str(e)}")
+        raise
+
+def execute_python_code(code, timeout=10):
+    """
+    Execute Python code in a safe environment with timeout
+    
+    Args:
+        code (str): Python code to execute
+        timeout (int): Maximum execution time in seconds
+    
+    Returns:
+        dict: Execution result with stdout, stderr and execution status
+    """
+    try:
+        # Create a temporary file for the code
+        with tempfile.NamedTemporaryFile(suffix='.py', mode='w', delete=False) as temp_file:
+            temp_file_path = temp_file.name
+            temp_file.write(code)
+        
+        # Execute the code in a separate process with timeout
+        logger.debug(f"Executing Python code with {timeout}s timeout")
+        process = subprocess.Popen(
+            ['python', temp_file_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+            return {
+                "status": "success" if process.returncode == 0 else "error",
+                "stdout": stdout,
+                "stderr": stderr,
+                "return_code": process.returncode
+            }
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return {
+                "status": "timeout",
+                "stdout": "",
+                "stderr": f"Execution timed out after {timeout} seconds",
+                "return_code": -1
+            }
+        finally:
+            # Clean up the temporary file
+            if os.path.exists(temp_file_path):
+                os.unlink(temp_file_path)
+    
+    except Exception as e:
+        logger.error(f"Error executing Python code: {str(e)}")
+        return {
+            "status": "error",
+            "stdout": "",
+            "stderr": str(e),
+            "return_code": -1
+        }
+
+def create_conversation_with_files(api_key, title, model, file_ids):
+    """
+    Create a conversation with files via Conversation API
+    
+    Args:
+        api_key (str): API key
+        title (str): Conversation title
+        model (str): Model name
+        file_ids (list): List of file IDs
+        
+    Returns:
+        str: Created conversation ID
+    """
+    try:
+        headers = {
+            "API-KEY": api_key,
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "title": title[:90],  # Limit to 90 characters
+            "type": "CHAT_WITH_PDF",
+            "model": model,
+            "fileList": file_ids
+        }
+        
+        logger.debug(f"Creating conversation with files: {file_ids}")
+        response = requests.post(ONE_MIN_CONVERSATION_API_URL, json=payload, headers=headers)
+        response.raise_for_status()
+        
+        conversation_id = response.json()['conversation']['uuid']
+        logger.debug(f"Conversation successfully created, ID: {conversation_id}")
+        
+        return conversation_id
+    except Exception as e:
+        logger.error(f"Error creating conversation: {str(e)}")
+        raise
 
 # The main function to start the server
 if __name__ == "__main__":
