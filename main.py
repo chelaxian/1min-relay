@@ -981,6 +981,13 @@ def process_stt_request():
                     with open('/tmp/last_voice_response.json', 'w', encoding='utf-8') as f:
                         json.dump(openai_format_response, f, ensure_ascii=False, indent=2)
                     
+                    # Удаление временного файла
+                    try:
+                        os.remove(temp_file_path)
+                        logger.debug(f"Removed temporary file: {temp_file_path}")
+                    except Exception as e:
+                        logger.error(f"Error removing temporary file: {str(e)}")
+                    
                     return jsonify(openai_format_response)
                 else:
                     logger.error(f"Error response from AI API: {response.status_code} - {response.text}")
@@ -1018,7 +1025,11 @@ def process_stt_request():
         }
         
         # Удаление временного файла
-        os.remove(audio_file_path)
+        try:
+            os.remove(temp_file_path)
+            logger.debug(f"Removed temporary file: {temp_file_path}")
+        except Exception as e:
+            logger.error(f"Error removing temporary file: {str(e)}")
         
         return jsonify(openai_format_response)
     
