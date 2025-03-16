@@ -29,6 +29,7 @@ from docx import Document as DocxDocument
 import io
 import sys
 from itertools import islice
+import hashlib
 
 # Suppress warnings from flask_limiter
 warnings.filterwarnings("ignore", category=UserWarning, module="flask_limiter.extension")
@@ -1049,18 +1050,55 @@ def conversation():
     # Process tools (function calling)
     tools_config = None
     try:
-        if 'tools' in request_data:
+        # Определяем базовый набор инструментов
+        base_tools = request_data.get('tools', [])
+        
+        # Для поддерживаемых моделей автоматически добавляем стандартные инструменты
+        if model in tools_supported_models:
+            # Добавляем стандартные инструменты, если они не указаны явно
+            if not base_tools:
+                base_tools = [
+                    {"type": "function", "function": {"name": "get_datetime", "description": "Get current date and time"}},
+                    {"type": "function", "function": {"name": "execute_python", "description": "Execute Python code"}},
+                    {"type": "function", "function": {"name": "web_search", "description": "Search the web"}}
+                ]
+            
             tools_config = process_tools(
-                request_data.get('tools', []),
+                base_tools,
                 request_data.get('tool_choice', 'auto'),
                 model
             )
+            logger.info(f"Added tools configuration for supported model {model}")
+        else:
+            # Для неподдерживаемых моделей пробуем обработать только явно указанные инструменты
+            if base_tools:
+                try:
+                    tools_config = process_tools(
+                        base_tools,
+                        request_data.get('tool_choice', 'auto'),
+                        model
+                    )
+                    logger.warning(f"Processing tools for potentially unsupported model {model}")
+                except Exception as tool_e:
+                    logger.warning(f"Failed to process tools for model {model}: {str(tool_e)}")
+                    # Продолжаем без инструментов
+                    pass
     except Exception as e:
-        # Any errors other than tool incompatibilities are treated as internal errors
-        return ERROR_HANDLER(1500, detail=str(e))
+        logger.error(f"Error processing tools: {str(e)}")
+        # Продолжаем без инструментов при ошибке
+        pass
     
     # Check for web search
     use_web_search = request_data.get('web_search', False)
+    # Автоматически включаем веб-поиск для поддерживаемых моделей, если в запросе есть ключевые слова
+    if model in web_search_supported_models and not use_web_search:
+        # Проверяем наличие ключевых слов для поиска в интернете
+        search_keywords = ['найди', 'поищи', 'search', 'найти', 'поиск', 'погугли', 'загугли']
+        user_message = messages[-1].get('content', '').lower()
+        if any(keyword in user_message.lower() for keyword in search_keywords):
+            use_web_search = True
+            logger.info(f"Automatically enabling web search for model {model} based on user message")
+    
     if use_web_search and model not in web_search_supported_models:
         logger.warning(f"Model {model} does not support web search, ignoring web search parameter")
         use_web_search = False
@@ -1204,13 +1242,15 @@ def transform_streaming_response(data, request_data, last_output, prompt_tokens)
         # Handle function call streaming
         if 'function_call' in data:
             func_call = data['function_call']
+            # Generate a stable ID for the function call
+            call_id = f"call_{hashlib.md5(json.dumps(func_call).encode()).hexdigest()}"
             choice = {
                 "index": 0,
                 "delta": {
                     "tool_calls": [
                         {
                             "index": 0,
-                            "id": f"call_{uuid.uuid4()}",
+                            "id": call_id,
                             "type": "function",
                             "function": {
                                 "name": func_call.get('name', ''),
@@ -1222,18 +1262,34 @@ def transform_streaming_response(data, request_data, last_output, prompt_tokens)
                 "finish_reason": None
             }
             choices.append(choice)
+            
+            # If we have a result, add it as a separate choice
+            if 'result' in data:
+                result_choice = {
+                    "index": 1,
+                    "delta": {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "name": func_call.get('name', ''),
+                        "content": json.dumps(data['result'])
+                    },
+                    "finish_reason": "tool_result"
+                }
+                choices.append(result_choice)
         else:
             # Handle tool_calls format
             tool_calls = data.get('tool_calls', [])
             if tool_calls:
                 for i, tool_call in enumerate(tool_calls):
+                    # Generate a stable ID for each tool call
+                    call_id = f"call_{hashlib.md5(json.dumps(tool_call).encode()).hexdigest()}"
                     choice = {
                         "index": i,
                         "delta": {
                             "tool_calls": [
                                 {
                                     "index": i,
-                                    "id": f"call_{uuid.uuid4()}",
+                                    "id": call_id,
                                     "type": "function",
                                     "function": {
                                         "name": tool_call.get('function', {}).get('name', ''),
@@ -1245,6 +1301,20 @@ def transform_streaming_response(data, request_data, last_output, prompt_tokens)
                         "finish_reason": None
                     }
                     choices.append(choice)
+                    
+                    # If we have a result for this tool call, add it
+                    if 'result' in tool_call:
+                        result_choice = {
+                            "index": len(choices),
+                            "delta": {
+                                "role": "tool",
+                                "tool_call_id": call_id,
+                                "name": tool_call.get('function', {}).get('name', ''),
+                                "content": json.dumps(tool_call['result'])
+                            },
+                            "finish_reason": "tool_result"
+                        }
+                        choices.append(result_choice)
     
     # Check for stop signal
     elif 'stop' in data and data['stop']:
@@ -1320,66 +1390,89 @@ def transform_response(one_min_response, request_data, prompt_tokens):
     
     # Handle tool calls if present
     if 'function_call' in one_min_response or 'tool_calls' in one_min_response:
-        # Extract function call data
-        function_call_data = one_min_response.get('function_call', one_min_response.get('tool_calls', [{}])[0])
-        function_name = function_call_data.get('name', '')
-        function_args = function_call_data.get('arguments', '{}')
+        tool_calls = []
         
-        # Process the function call with appropriate handler
-        result = None
-        try:
-            if function_name == 'get_current_datetime':
-                # Parse arguments
-                args = json.loads(function_args) if isinstance(function_args, str) else function_args
-                result = handle_get_datetime(args)
-            elif function_name == 'execute_python':
-                args = json.loads(function_args) if isinstance(function_args, str) else function_args
-                result = handle_execute_python(args)
-            elif function_name == 'web_search':
-                args = json.loads(function_args) if isinstance(function_args, str) else function_args
-                result = handle_web_search(args)
-        except Exception as e:
-            logger.error(f"Error handling function call {function_name}: {str(e)}")
-            result = {"error": str(e)}
+        # Convert old function_call format to new tool_calls
+        if 'function_call' in one_min_response:
+            tool_calls = [{
+                'name': one_min_response['function_call'].get('name', ''),
+                'arguments': one_min_response['function_call'].get('arguments', '{}'),
+                'id': f"call_{uuid.uuid4()}"
+            }]
+        else:
+            tool_calls = one_min_response.get('tool_calls', [])
+            for call in tool_calls:
+                if 'id' not in call:
+                    call['id'] = f"call_{uuid.uuid4()}"
         
-        # Format the OpenAI response to include both function call and function result
+        # Process each tool call
+        processed_calls = []
+        for tool_call in tool_calls:
+            function_name = tool_call.get('name', '')
+            function_args = tool_call.get('arguments', '{}')
+            call_id = tool_call.get('id')
+            
+            # Prepare arguments
+            try:
+                args = json.loads(function_args) if isinstance(function_args, str) else function_args
+            except json.JSONDecodeError:
+                logger.error(f"Invalid JSON in arguments for {function_name}: {function_args}")
+                args = {}
+            
+            # Process with appropriate handler
+            result = None
+            try:
+                if function_name == 'get_datetime':
+                    result = handle_get_datetime(args)
+                elif function_name == 'execute_python':
+                    result = handle_execute_python(args)
+                elif function_name == 'web_search':
+                    result = handle_web_search(args)
+                else:
+                    logger.warning(f"Unknown function {function_name}")
+                    result = {"error": f"Unknown function {function_name}"}
+            except Exception as e:
+                logger.error(f"Error handling function {function_name}: {str(e)}")
+                result = {"error": str(e)}
+            
+            processed_calls.append({
+                "call": {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": function_name,
+                        "arguments": json.dumps(args)
+                    }
+                },
+                "result": result
+            })
+        
+        # Create response with tool calls
         choice = {
             "index": 0,
             "message": {
                 "role": "assistant",
                 "content": None,
-                "tool_calls": [
-                    {
-                        "id": f"call_{uuid.uuid4()}",
-                        "type": "function",
-                        "function": {
-                            "name": function_name,
-                            "arguments": function_args
-                        }
-                    }
-                ]
+                "tool_calls": [pc["call"] for pc in processed_calls]
             },
-            "finish_reason": "tool_call"
+            "finish_reason": "tool_calls"
         }
+        transformed_response["choices"].append(choice)
         
-        # If we successfully processed the function, add the result
-        if result:
-            # Create a follow-up message with the function result
-            transformed_response["choices"].append(choice)
-            
-            # Add a second choice with the function result
-            result_json = json.dumps(result)
-            choice2 = {
-                "index": 1,
-                "message": {
-                    "role": "tool",
-                    "tool_call_id": choice["message"]["tool_calls"][0]["id"],
-                    "name": function_name,
-                    "content": result_json
-                },
-                "finish_reason": "tool_result"
-            }
-            transformed_response["choices"].append(choice2)
+        # Add tool call results
+        for i, pc in enumerate(processed_calls):
+            if pc["result"]:
+                result_choice = {
+                    "index": i + 1,
+                    "message": {
+                        "role": "tool",
+                        "tool_call_id": pc["call"]["id"],
+                        "name": pc["call"]["function"]["name"],
+                        "content": json.dumps(pc["result"])
+                    },
+                    "finish_reason": "tool_result"
+                }
+                transformed_response["choices"].append(result_choice)
     else:
         # Regular text response
         choice = {
