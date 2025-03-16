@@ -803,23 +803,29 @@ def process_stt_request():
     Returns:
         Response: Flask response with transcription or error
     """
+    logger.info("Processing speech-to-text request")
+    
     auth_header = request.headers.get('Authorization')
     if not auth_header or not auth_header.startswith("Bearer "):
+        logger.error("Missing or invalid authorization header")
         return ERROR_HANDLER(1021)
     
     api_key = auth_header.split(" ")[1]
     
     # Check if file is uploaded
     if 'file' not in request.files:
+        logger.error("No audio file in request")
         return ERROR_HANDLER(1700, detail="No audio file provided")
     
     audio_file = request.files['file']
     model = request.form.get('model', 'whisper-1')
+    logger.info(f"Processing audio file: {audio_file.filename} with model: {model}")
     
     # Save the file temporarily
     with tempfile.NamedTemporaryFile(delete=False) as temp_file:
         audio_file.save(temp_file.name)
         temp_file_path = temp_file.name
+        logger.debug(f"Saved audio file temporarily at: {temp_file_path}")
     
     try:
         # Upload to 1minAI
@@ -828,24 +834,60 @@ def process_stt_request():
             'asset': (audio_file.filename, open(temp_file_path, 'rb'), audio_file.content_type)
         }
         
+        logger.info(f"Uploading audio file to 1minAI asset URL: {ONE_MIN_ASSET_URL}")
         asset_response = requests.post(ONE_MIN_ASSET_URL, files=files, headers=headers)
         asset_response.raise_for_status()
         
         # Get audio path
-        audio_path = asset_response.json()['fileContent']['path']
+        asset_data = asset_response.json()
+        logger.debug(f"Asset response: {json.dumps(asset_data)[:200]}...")
+        audio_path = asset_data['fileContent']['path']
+        logger.info(f"Audio file uploaded successfully. Path: {audio_path}")
         
-        # Transcribe audio
+        # Transcribe audio используя правильный эндпоинт и формат согласно документации
         payload = {
-            "audioPath": audio_path,
-            "model": model
+            "type": "SPEECH_TO_TEXT",
+            "model": model,
+            "promptObject": {
+                "audioUrl": audio_path,
+                "response_format": "text"
+            }
         }
         
-        response = requests.post(ONE_MIN_SPEECH_TO_TEXT_URL, json=payload, headers=headers)
+        # Используем основной API эндпоинт вместо специального для STT
+        logger.info(f"Sending transcription request to: {ONE_MIN_API_URL}")
+        logger.debug(f"Transcription payload: {json.dumps(payload)}")
+        
+        # Правильно установить заголовки
+        headers = {
+            "API-KEY": api_key,
+            "Content-Type": "application/json"
+        }
+        
+        response = requests.post(ONE_MIN_API_URL, json=payload, headers=headers)
+        
+        # Log response details before raising an exception
+        logger.debug(f"Speech-to-text response status: {response.status_code}")
+        logger.debug(f"Speech-to-text response headers: {response.headers}")
+        try:
+            response_json = response.json()
+            logger.debug(f"Speech-to-text response body: {json.dumps(response_json)[:200]}...")
+        except:
+            logger.debug(f"Speech-to-text response body (not JSON): {response.text[:200]}...")
+        
         response.raise_for_status()
         
-        # Format response
-        stt_response = response.json()
-        transcription = stt_response.get('text', '')
+        # Format response - изменен формат ответа согласно документации
+        transcription = response.text  # Для формата "text"
+        try:
+            # В случае, если ответ все же в формате JSON
+            response_data = response.json()
+            if isinstance(response_data, dict) and 'text' in response_data:
+                transcription = response_data['text']
+        except:
+            pass
+            
+        logger.info(f"Transcription successful: {transcription[:50]}...")
         
         return jsonify({
             "text": transcription
