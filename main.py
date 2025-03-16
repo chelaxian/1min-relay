@@ -2415,8 +2415,11 @@ def save_audio_file(file):
     Returns:
         str: Путь к сохраненному файлу
     """
+    import uuid
     temp_dir = tempfile.gettempdir()
-    temp_file_path = os.path.join(temp_dir, f"tmp{tempfile.NamedTemporaryFile().name}")
+    # Создаем уникальное имя файла без вложенных директорий
+    filename = f"audio_{uuid.uuid4().hex}.mp3"
+    temp_file_path = os.path.join(temp_dir, filename)
     file.save(temp_file_path)
     logger.debug(f"Saved audio file temporarily at: {temp_file_path}")
     return temp_file_path
