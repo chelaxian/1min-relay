@@ -176,13 +176,13 @@ ALL_ONE_MIN_AVAILABLE_MODELS = [
 vision_supported_models = [
     "gpt-4o",
     "gpt-4o-mini",
-    "gpt-4-turbo" #,
-    #"claude-3-5-sonnet-20240620",
-    #"claude-3-opus-20240229",
-    #"claude-3-sonnet-20240229",
-    #"claude-3-haiku-20240307",
-    #"gemini-1.5-pro",
-    #"gemini-1.5-flash"
+    "gpt-4-turbo",
+    "claude-3-5-sonnet-20240620",
+    "claude-3-opus-20240229",
+    "claude-3-sonnet-20240229",
+    "claude-3-haiku-20240307",
+    "gemini-1.5-pro",
+    "gemini-1.5-flash"
 ]
 
 # Define models that support tool use (function calling)
@@ -1612,9 +1612,61 @@ def transform_response(one_min_response, request_data, prompt_tokens):
                 if function_name == 'get_datetime':
                     result = handle_get_datetime(args)
                 elif function_name == 'execute_python':
+                    # Улучшенная обработка execute_python
+                    logger.info(f"Executing Python code from tool call: {args.get('code', '')[:100]}...")
+                    
+                    # Если в телеграм-боте, логируем дополнительную информацию
+                    source = request_data.get('source', '')
+                    if source == 'telegram_bot':
+                        logger.info(f"Request from telegram bot - executing Python: {args.get('code', '')[:50]}...")
+                    
                     result = handle_execute_python(args)
+                    
+                    # Логируем результат подробнее
+                    if result and isinstance(result, dict):
+                        status = result.get('status', 'unknown')
+                        output_len = len(result.get('output', ''))
+                        error = result.get('error', None)
+                        logger.info(f"Python execution result: status={status}, output_length={output_len}, error={'yes' if error else 'no'}")
+                    
                 elif function_name == 'web_search':
-                    result = handle_web_search(args)
+                    # Улучшенная обработка web_search
+                    query = args.get('query', '')
+                    logger.info(f"Executing web search from tool call: query='{query}'")
+                    
+                    # Извлекаем API ключ
+                    api_key = extract_api_key()
+                    if not api_key:
+                        logger.warning("API key not found for web search, using default")
+                        api_key = None
+                    
+                    # Если в телеграм-боте, логируем дополнительную информацию
+                    source = request_data.get('source', '')
+                    if source == 'telegram_bot':
+                        logger.info(f"Request from telegram bot - searching for: {query}")
+                    
+                    # Выполняем поиск с явным вызовом web_search
+                    search_results = web_search(query, api_key)
+                    
+                    # Преобразуем в формат результата инструмента
+                    formatted_results = []
+                    for result_item in search_results.get('results', []):
+                        formatted_results.append({
+                            "title": result_item.get('title', ''),
+                            "url": result_item.get('url', ''),
+                            "snippet": result_item.get('snippet', ''),
+                            "date": result_item.get('date', '')
+                        })
+                    
+                    result = {
+                        "query": query,
+                        "results": formatted_results,
+                        "total_results": len(formatted_results)
+                    }
+                    
+                    # Логируем результат подробнее
+                    logger.info(f"Web search results: found {len(formatted_results)} results for query '{query}'")
+                    
                 else:
                     logger.warning(f"Unknown function {function_name}")
                     result = {"error": f"Unknown function {function_name}"}
@@ -2543,6 +2595,76 @@ def relay():
         processing_time = (end_time - start_time).total_seconds()
         response_data["processing_time"] = processing_time
         logger.info(f"Request processed in {processing_time:.2f} seconds")
+        
+        response = jsonify(response_data)
+        return set_response_headers(response)
+
+@app.route('/api/tools', methods=['POST', 'OPTIONS'])
+def tools_endpoint():
+    """
+    Эндпоинт для прямого выполнения инструментов через HTTP API
+    """
+    if request.method == 'OPTIONS':
+        return handle_options_request()
+    
+    start_time = datetime.datetime.now()
+    response_data = {
+        "status": "error",
+        "message": "Unknown error occurred",
+        "data": None,
+        "processing_time": None
+    }
+    
+    try:
+        data = request.get_json()
+        if not data:
+            response_data["message"] = "No data provided"
+            return jsonify(response_data)
+        
+        tool = data.get("tool", "")
+        if not tool:
+            response_data["message"] = "No tool specified"
+            return jsonify(response_data)
+        
+        query = data.get("query", "")
+        code = data.get("code", "")
+        api_key = data.get("api_key", "")
+        
+        # Определяем, какой инструмент использовать
+        if tool == "web_search":
+            if not query:
+                response_data["message"] = "No query provided for web search"
+                return jsonify(response_data)
+            
+            logger.info(f"Processing web_search request for query: {query}")
+            result = web_search(query, api_key)
+            response_data["status"] = "success"
+            response_data["data"] = result
+            response_data["message"] = "Web search completed successfully"
+            
+        elif tool == "execute_python":
+            if not code:
+                response_data["message"] = "No code provided for execution"
+                return jsonify(response_data)
+            
+            logger.info(f"Processing execute_python request: {code[:50]}...")
+            result = execute_python_code(code)
+            response_data["status"] = "success"
+            response_data["data"] = result
+            response_data["message"] = "Python code executed successfully"
+            
+        else:
+            response_data["message"] = f"Unknown tool: {tool}"
+            
+    except Exception as e:
+        logger.error(f"Error in tools_endpoint: {str(e)}")
+        response_data["message"] = f"Error: {str(e)}"
+        
+    finally:
+        end_time = datetime.datetime.now()
+        processing_time = (end_time - start_time).total_seconds()
+        response_data["processing_time"] = processing_time
+        logger.info(f"Tools request processed in {processing_time:.2f} seconds")
         
         response = jsonify(response_data)
         return set_response_headers(response)
