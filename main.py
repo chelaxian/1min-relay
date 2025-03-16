@@ -1172,6 +1172,98 @@ def audio_speech():
 
 @app.route('/v1/chat/completions', methods=['POST', 'OPTIONS'])
 @limiter.limit("500 per minute")
+def process_user_input(messages):
+    """
+    Process the user input from messages, extracting text and images.
+    
+    Args:
+        messages (list): List of message objects
+        
+    Returns:
+        tuple: (user_input, image_paths, has_image)
+    """
+    user_input = ""
+    image_paths = []
+    has_image = False
+    
+    # Check for empty messages
+    if not messages:
+        logger.warning("No messages provided")
+        return "", [], False
+    
+    # Get the last user message
+    last_user_message = None
+    for msg in reversed(messages):
+        if msg.get('role') == 'user':
+            last_user_message = msg
+            break
+    
+    if not last_user_message:
+        logger.warning("No user message found")
+        return "", [], False
+    
+    # Extract content from the last user message
+    content = last_user_message.get('content', '')
+    
+    # Handle multimodal content
+    if isinstance(content, list):
+        # Content is a list of objects
+        text_parts = []
+        
+        for item in content:
+            item_type = item.get('type')
+            
+            if item_type == 'text':
+                text_parts.append(item.get('text', ''))
+            elif item_type == 'image_url':
+                # Process image URL
+                image_url = item.get('image_url', {}).get('url', '')
+                if image_url.startswith('data:'):
+                    # Base64 encoded image
+                    try:
+                        # Extract content type and base64 data
+                        parts = image_url.split(',', 1)
+                        if len(parts) == 2:
+                            content_type = parts[0].split(';')[0].split(':')[1]
+                            base64_data = parts[1]
+                            
+                            # Determine file extension
+                            ext = 'jpg'  # Default
+                            if 'png' in content_type:
+                                ext = 'png'
+                            elif 'webp' in content_type:
+                                ext = 'webp'
+                            elif 'gif' in content_type:
+                                ext = 'gif'
+                            
+                            # Save image to temp file
+                            import base64
+                            import tempfile
+                            import os
+                            
+                            temp_dir = tempfile.gettempdir()
+                            temp_file = os.path.join(temp_dir, f"image_{uuid.uuid4()}.{ext}")
+                            
+                            with open(temp_file, 'wb') as f:
+                                f.write(base64.b64decode(base64_data))
+                            
+                            image_paths.append(temp_file)
+                            has_image = True
+                            logger.debug(f"Saved image to {temp_file}")
+                        else:
+                            logger.error("Invalid data URL format")
+                    except Exception as e:
+                        logger.error(f"Error processing base64 image: {str(e)}")
+                else:
+                    # URL to image - not supported in this implementation
+                    logger.warning(f"External image URLs not supported: {image_url[:30]}...")
+        
+        user_input = "\n".join(text_parts)
+    else:
+        # Content is a string
+        user_input = content
+    
+    return user_input, image_paths, has_image
 def conversation():
     """
     Main endpoint for the OpenAI-compatible API conversation
@@ -2656,106 +2748,11 @@ def tools_endpoint():
         response = jsonify(response_data)
         return set_response_headers(response)
 
-# The main function to start the server
-if __name__ == "__main__":
-    # Set the logging level
-    if os.environ.get('DEBUG') == 'True':
-        logging.getLogger().setLevel(logging.DEBUG)
-    else:
-        logging.getLogger().setLevel(logging.INFO)
-    
+def main():
     # Start the server
     app.run(host="0.0.0.0", port=PORT, debug=DEBUG_MODE)
 
-def process_user_input(messages):
-    """
-    Process the user input from messages, extracting text and images.
-    
-    Args:
-        messages (list): List of message objects
-        
-    Returns:
-        tuple: (user_input, image_paths, has_image)
-    """
-    user_input = ""
-    image_paths = []
-    has_image = False
-    
-    # Check for empty messages
-    if not messages:
-        logger.warning("No messages provided")
-        return "", [], False
-    
-    # Get the last user message
-    last_user_message = None
-    for msg in reversed(messages):
-        if msg.get('role') == 'user':
-            last_user_message = msg
-            break
-    
-    if not last_user_message:
-        logger.warning("No user message found")
-        return "", [], False
-    
-    # Extract content from the last user message
-    content = last_user_message.get('content', '')
-    
-    # Handle multimodal content
-    if isinstance(content, list):
-        # Content is a list of objects
-        text_parts = []
-        
-        for item in content:
-            item_type = item.get('type')
-            
-            if item_type == 'text':
-                text_parts.append(item.get('text', ''))
-            elif item_type == 'image_url':
-                # Process image URL
-                image_url = item.get('image_url', {}).get('url', '')
-                if image_url.startswith('data:'):
-                    # Base64 encoded image
-                    try:
-                        # Extract content type and base64 data
-                        parts = image_url.split(',', 1)
-                        if len(parts) == 2:
-                            content_type = parts[0].split(';')[0].split(':')[1]
-                            base64_data = parts[1]
-                            
-                            # Determine file extension
-                            ext = 'jpg'  # Default
-                            if 'png' in content_type:
-                                ext = 'png'
-                            elif 'webp' in content_type:
-                                ext = 'webp'
-                            elif 'gif' in content_type:
-                                ext = 'gif'
-                            
-                            # Save image to temp file
-                            import base64
-                            import tempfile
-                            import os
-                            
-                            temp_dir = tempfile.gettempdir()
-                            temp_file = os.path.join(temp_dir, f"image_{uuid.uuid4()}.{ext}")
-                            
-                            with open(temp_file, 'wb') as f:
-                                f.write(base64.b64decode(base64_data))
-                            
-                            image_paths.append(temp_file)
-                            has_image = True
-                            logger.debug(f"Saved image to {temp_file}")
-                        else:
-                            logger.error("Invalid data URL format")
-                    except Exception as e:
-                        logger.error(f"Error processing base64 image: {str(e)}")
-                else:
-                    # URL to image - not supported in this implementation
-                    logger.warning(f"External image URLs not supported: {image_url[:30]}...")
-        
-        user_input = "\n".join(text_parts)
-    else:
-        # Content is a string
-        user_input = content
-    
-    return user_input, image_paths, has_image
+# Запуск приложения
+if __name__ == "__main__":
+    main()
+
