@@ -30,6 +30,7 @@ import io
 import sys
 from itertools import islice
 import hashlib
+import traceback
 
 # Suppress warnings from flask_limiter
 warnings.filterwarnings("ignore", category=UserWarning, module="flask_limiter.extension")
@@ -119,16 +120,6 @@ ONE_MIN_API_URL = "https://api.1min.ai/api/features"
 ONE_MIN_CONVERSATION_API_URL = "https://api.1min.ai/api/conversations"
 ONE_MIN_CONVERSATION_API_STREAMING_URL = "https://api.1min.ai/api/features?isStreaming=true"
 ONE_MIN_ASSET_URL = "https://api.1min.ai/api/assets"
-ONE_MIN_TOOLS_URL = "https://api.1min.ai/api/tools"
-ONE_MIN_TEXT_TO_SPEECH_URL = "https://api.1min.ai/api/text-to-speech"
-ONE_MIN_SPEECH_TO_TEXT_URL = "https://api.1min.ai/api/speech-to-text"
-ONE_MIN_SEARCH_URL = "https://api.1min.ai/api/websearch"
-ONE_MIN_ANALYTICS_URL = "https://api.1min.ai/api/analytics"
-ONE_MIN_EMBEDDINGS_API_URL = "https://api.1min.ai/api/embeddings"
-ONE_MIN_IMAGE_API_URL = "https://api.1min.ai/api/images"
-ONE_MIN_MODERATION_API_URL = "https://api.1min.ai/api/moderations"
-ONE_MIN_ASSISTANTS_API_URL = "https://api.1min.ai/api/assistants"
-ONE_MIN_FILES_API_URL = "https://api.1min.ai/api/files"
 
 # Define the models that are available for use
 ALL_ONE_MIN_AVAILABLE_MODELS = [
@@ -763,18 +754,29 @@ def process_tts_request(request_data):
     # if model not in tts_supported_models:
     #     return ERROR_HANDLER(1046, model=model)
     
-    # Prepare request to 1minAI
-    headers = {"API-KEY": api_key}
+    # Prepare request to 1minAI API using unified endpoint
+    headers = {
+        "API-KEY": api_key,
+        "Content-Type": "application/json"
+    }
+    
+    # Использование единого эндпоинта с типом TEXT_TO_SPEECH
     payload = {
-        "text": input_text,
-        "voice": voice,
+        "type": "TEXT_TO_SPEECH",
         "model": model,
-        "speed": speed,
-        "format": response_format
+        "promptObject": {
+            "text": input_text,
+            "voice": voice,
+            "speed": speed,
+            "response_format": response_format
+        }
     }
     
     try:
-        response = requests.post(ONE_MIN_TEXT_TO_SPEECH_URL, json=payload, headers=headers)
+        logger.info(f"Sending TTS request to: {ONE_MIN_API_URL}")
+        logger.debug(f"TTS payload: {json.dumps(payload)}")
+        
+        response = requests.post(ONE_MIN_API_URL, json=payload, headers=headers)
         response.raise_for_status()
         
         # Get the audio data
@@ -794,14 +796,15 @@ def process_tts_request(request_data):
         
         return flask_response
     except requests.exceptions.RequestException as e:
+        logger.error(f"Error in TTS processing: {str(e)}")
         return ERROR_HANDLER(1500, detail=str(e))
 
 def process_stt_request():
     """
-    Process speech-to-text request
+    Process speech-to-text request and forward the transcribed text to the original model
     
     Returns:
-        Response: Flask response with transcription or error
+        Response: Flask response with AI completion or error
     """
     logger.info("Processing speech-to-text request")
     
@@ -818,8 +821,11 @@ def process_stt_request():
         return ERROR_HANDLER(1700, detail="No audio file provided")
     
     audio_file = request.files['file']
-    model = request.form.get('model', 'whisper-1')
-    logger.info(f"Processing audio file: {audio_file.filename} with model: {model}")
+    
+    # Get the originally requested model (which will process the transcribed text)
+    original_model = request.form.get('model', 'gpt-4o-mini')
+    logger.info(f"Original model requested: {original_model}")
+    logger.info(f"Processing audio file: {audio_file.filename} with whisper-1 for transcription")
     
     # Save the file temporarily
     with tempfile.NamedTemporaryFile(delete=False) as temp_file:
@@ -829,7 +835,9 @@ def process_stt_request():
     
     try:
         # Upload to 1minAI
-        headers = {"API-KEY": api_key}
+        headers = {
+            "API-KEY": api_key,
+        }
         files = {
             'asset': (audio_file.filename, open(temp_file_path, 'rb'), audio_file.content_type)
         }
@@ -844,29 +852,28 @@ def process_stt_request():
         audio_path = asset_data['fileContent']['path']
         logger.info(f"Audio file uploaded successfully. Path: {audio_path}")
         
-        # Transcribe audio используя правильный эндпоинт и формат согласно документации
+        # Transcribe audio using whisper-1 model regardless of original model choice
         payload = {
             "type": "SPEECH_TO_TEXT",
-            "model": model,
+            "model": "whisper-1",  # Always use whisper-1 for transcription
             "promptObject": {
                 "audioUrl": audio_path,
                 "response_format": "text"
             }
         }
         
-        # Используем основной API эндпоинт вместо специального для STT
-        logger.info(f"Sending transcription request to: {ONE_MIN_API_URL}")
-        logger.debug(f"Transcription payload: {json.dumps(payload)}")
-        
-        # Правильно установить заголовки
+        # Headers for transcription request
         headers = {
             "API-KEY": api_key,
             "Content-Type": "application/json"
         }
         
+        # Send request to transcribe audio
+        logger.info(f"Sending transcription request to: {ONE_MIN_API_URL}")
+        logger.debug(f"Transcription payload: {json.dumps(payload)}")
         response = requests.post(ONE_MIN_API_URL, json=payload, headers=headers)
         
-        # Log response details before raising an exception
+        # Log response details
         logger.debug(f"Speech-to-text response status: {response.status_code}")
         logger.debug(f"Speech-to-text response headers: {response.headers}")
         try:
@@ -877,10 +884,10 @@ def process_stt_request():
         
         response.raise_for_status()
         
-        # Format response - изменен формат ответа согласно документации
-        transcription = response.text  # Для формата "text"
+        # Get transcription text from response
+        transcription = response.text  # For format "text"
         try:
-            # В случае, если ответ все же в формате JSON
+            # Try to parse JSON response if that's what we got
             response_data = response.json()
             if isinstance(response_data, dict) and 'text' in response_data:
                 transcription = response_data['text']
@@ -889,17 +896,152 @@ def process_stt_request():
             
         logger.info(f"Transcription successful: {transcription[:50]}...")
         
-        return jsonify({
-            "text": transcription
-        })
-    except requests.exceptions.RequestException as e:
-        return ERROR_HANDLER(1500, detail=str(e))
-    finally:
+        # Now that we have the transcription, send it to the original model
+        # Prepare the request similar to how /v1/chat/completions works
+        
+        # Create a message for the original model with the transcription as content
+        messages = [
+            {"role": "user", "content": transcription}
+        ]
+        
+        # Check if we have a system message in the form data
+        system_message = request.form.get('system_message')
+        if system_message:
+            messages.insert(0, {"role": "system", "content": system_message})
+        
+        # Format for conversation API
+        logger.info(f"Forwarding transcribed text to original model: {original_model}")
+        
+        # Get additional parameters from the request
+        temperature = float(request.form.get('temperature', 0.7))
+        max_tokens = int(request.form.get('max_tokens', 1024))
+        top_p = float(request.form.get('top_p', 1.0))
+        
+        # Create a simulated request to conversation endpoint
+        conversation_payload = {
+            "model": original_model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "top_p": top_p,
+            "stream": True  # Stream the response back
+        }
+        
+        # Process the conversation request
+        logger.info(f"Processing transcribed text with model {original_model}")
+        
+        # Extract model capabilities
+        use_web_search = False
+        if original_model in web_search_supported_models:
+            use_web_search = True
+            logger.debug(f"Enabling web search for model {original_model}")
+        
+        # Prepare 1minAI API request
+        payload = {
+            "type": "CHAT_WITH_AI",
+            "model": original_model,
+            "promptObject": {
+                "prompt": transcription,
+                "isMixed": False,
+                "webSearch": use_web_search
+            }
+        }
+        
+        # Add additional parameters
+        payload["temperature"] = temperature
+        payload["top_p"] = top_p
+        
+        # Determine whether to use streaming
+        streaming = True
+        
+        # Create API URL based on streaming or not
+        api_url = ONE_MIN_CONVERSATION_API_STREAMING_URL if streaming else ONE_MIN_API_URL
+        
+        # Log the final request
+        logger.debug(f"Sending request to {api_url} with payload: {json.dumps(payload)[:200]}...")
+        
+        def generate():
+            # Set up headers for the API request
+            headers = {
+                "API-KEY": api_key,
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            }
+            
+            # Send the request to 1minAI API
+            with requests.post(api_url, json=payload, headers=headers, stream=streaming) as response:
+                response.raise_for_status()
+                
+                # Process the response based on streaming or not
+                if streaming:
+                    # Process streaming response
+                    prompt_tokens = len(transcription.split())
+                    total_completion_tokens = 0
+                    
+                    # Yield the initial chunk
+                    initial_response = transform_streaming_chunk({}, messages, original_model)
+                    yield f"data: {json.dumps(initial_response)}\n\n"
+                    
+                    # Process each chunk in the streaming response
+                    for line in response.iter_lines():
+                        if line:
+                            try:
+                                # Try to parse the line as JSON
+                                data = json.loads(line.decode('utf-8'))
+                                transformed_chunk = transform_streaming_chunk(data, messages, original_model)
+                                yield f"data: {json.dumps(transformed_chunk)}\n\n"
+                                
+                                # Count tokens for debugging
+                                if 'content' in data:
+                                    total_completion_tokens += len(data['content'].split())
+                            except Exception as e:
+                                logger.error(f"Error processing streaming chunk: {str(e)}")
+                                # Send error info to client
+                                error_chunk = {
+                                    "id": f"chatcmpl-{uuid.uuid4()}",
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": original_model,
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {"content": f"\nError: {str(e)}"},
+                                            "finish_reason": "error"
+                                        }
+                                    ]
+                                }
+                                yield f"data: {json.dumps(error_chunk)}\n\n"
+                    
+                    # Send the final [DONE] marker
+                    yield "data: [DONE]\n\n"
+                    
+                    # Log completion for debugging
+                    logger.debug(f"Finished processing streaming response. Completion tokens: {total_completion_tokens}")
+                    logger.debug(f"Total tokens: {prompt_tokens + total_completion_tokens}")
+                else:
+                    # Process non-streaming response
+                    response_data = response.json()
+                    prompt_tokens = len(transcription.split())
+                    
+                    # Transform response
+                    transformed_response = transform_response(response_data, conversation_payload, prompt_tokens)
+                    
+                    # Return response in streaming format for consistency
+                    yield f"data: {json.dumps(transformed_response)}\n\n"
+                    yield "data: [DONE]\n\n"
+        
+        # Return response as a streaming response
+        return Response(generate(), mimetype='text/event-stream')
+    
+    except Exception as e:
+        logger.error(f"Error in STT processing: {str(e)}")
+        logger.error(traceback.format_exc())
         # Clean up the temporary file
         try:
             os.unlink(temp_file_path)
         except:
             pass
+        return ERROR_HANDLER(1500, detail=str(e))
 
 def web_search(query, api_key=None, num_results=5):
     """
@@ -1596,16 +1738,23 @@ def embeddings():
         
         # Prepare the payload for 1minAI API
         payload = {
-            "text": input_text if isinstance(input_text, str) else input_text,
-            "api_key": api_key
+            "type": "EMBEDDINGS",
+            "model": model,
+            "promptObject": {
+                "text": input_text if isinstance(input_text, str) else json.dumps(input_text)
+            }
         }
         
         headers = {
+            "API-KEY": api_key,
             "Content-Type": "application/json"
         }
         
-        # Make the request to 1minAI embeddings API
-        response = requests.post(ONE_MIN_EMBEDDINGS_API_URL, json=payload, headers=headers)
+        logger.info(f"Sending embeddings request to: {ONE_MIN_API_URL}")
+        logger.debug(f"Embeddings payload: {json.dumps(payload)[:200]}...")
+        
+        # Make the request to 1minAI unified API endpoint
+        response = requests.post(ONE_MIN_API_URL, json=payload, headers=headers)
         response.raise_for_status()
         
         one_min_response = response.json()
@@ -1662,19 +1811,25 @@ def images_generations():
         
         # Prepare the payload for 1minAI API
         payload = {
-            "prompt": request_data.get('prompt'),
-            "n": request_data.get('n', 1),
-            "size": request_data.get('size', '1024x1024'),
-            "api_key": api_key,
-            "model": request_data.get('model', 'dall-e-3')
+            "type": "IMAGE_GENERATOR",
+            "model": request_data.get('model', 'dall-e-3'),
+            "promptObject": {
+                "prompt": request_data.get('prompt'),
+                "n": request_data.get('n', 1),
+                "size": request_data.get('size', '1024x1024')
+            }
         }
         
         headers = {
+            "API-KEY": api_key,
             "Content-Type": "application/json"
         }
         
-        # Make the request to 1minAI image generation API
-        response = requests.post(ONE_MIN_IMAGE_API_URL, json=payload, headers=headers)
+        logger.info(f"Sending image generation request to: {ONE_MIN_API_URL}")
+        logger.debug(f"Image generation payload: {json.dumps(payload)[:200]}...")
+        
+        # Make the request to 1minAI unified API endpoint
+        response = requests.post(ONE_MIN_API_URL, json=payload, headers=headers)
         response.raise_for_status()
         
         one_min_response = response.json()
@@ -1728,16 +1883,23 @@ def moderations():
         
         # Prepare the payload for 1minAI API
         payload = {
-            "text": request_data.get('input', ''),
-            "api_key": api_key
+            "type": "MODERATION",
+            "model": request_data.get('model', 'text-moderation-latest'),
+            "promptObject": {
+                "text": request_data.get('input', '')
+            }
         }
         
         headers = {
+            "API-KEY": api_key,
             "Content-Type": "application/json"
         }
         
-        # Make the request to 1minAI moderation API
-        response = requests.post(ONE_MIN_MODERATION_API_URL, json=payload, headers=headers)
+        logger.info(f"Sending moderation request to: {ONE_MIN_API_URL}")
+        logger.debug(f"Moderation payload: {json.dumps(payload)[:200]}...")
+        
+        # Make the request to 1minAI unified API endpoint
+        response = requests.post(ONE_MIN_API_URL, json=payload, headers=headers)
         response.raise_for_status()
         
         one_min_response = response.json()
@@ -1792,21 +1954,28 @@ def assistants():
             # Create a new assistant
             request_data = request.get_json()
             
-            # Forward the request to 1minAI assistants API
+            # Prepare payload for 1minAI API
             payload = {
-                "api_key": api_key,
-                "name": request_data.get('name'),
-                "description": request_data.get('description'),
-                "instructions": request_data.get('instructions'),
+                "type": "ASSISTANT_CREATE",
                 "model": request_data.get('model', DEFAULT_MODEL),
-                "tools": request_data.get('tools', [])
+                "promptObject": {
+                    "name": request_data.get('name'),
+                    "description": request_data.get('description'),
+                    "instructions": request_data.get('instructions'),
+                    "tools": request_data.get('tools', [])
+                }
             }
             
             headers = {
+                "API-KEY": api_key,
                 "Content-Type": "application/json"
             }
             
-            response = requests.post(ONE_MIN_ASSISTANTS_API_URL, json=payload, headers=headers)
+            logger.info(f"Sending assistant creation request to: {ONE_MIN_API_URL}")
+            logger.debug(f"Assistant creation payload: {json.dumps(payload)[:200]}...")
+            
+            # Send request to unified API endpoint
+            response = requests.post(ONE_MIN_API_URL, json=payload, headers=headers)
             response.raise_for_status()
             
             one_min_response = response.json()
@@ -1850,11 +2019,20 @@ def files():
     if request.method == 'GET':
         # List files
         try:
-            params = {
-                "api_key": api_key
+            # Prepare payload for files listing
+            payload = {
+                "type": "FILES_LIST"
             }
             
-            response = requests.get(ONE_MIN_FILES_API_URL, params=params)
+            headers = {
+                "API-KEY": api_key,
+                "Content-Type": "application/json"
+            }
+            
+            logger.info(f"Sending files list request to: {ONE_MIN_API_URL}")
+            
+            # Send request to unified API endpoint
+            response = requests.post(ONE_MIN_API_URL, json=payload, headers=headers)
             response.raise_for_status()
             
             one_min_response = response.json()
@@ -2002,98 +2180,12 @@ def files():
                 logger.error(f"Error processing file: {str(file_error)}")
                 return ERROR_HANDLER(1700, detail=f"Error processing file: {str(file_error)}")
             
-            # Legacy code path (should not be reached)
-            # Prepare multipart form data
-            files = {
-                'file': (file.filename, file.stream, file.content_type)
-            }
-            
-            data = {
-                'api_key': api_key,
-                'purpose': purpose
-            }
-            
-            # Make request to 1minAI file upload API
-            response = requests.post(ONE_MIN_FILES_API_URL, files=files, data=data)
-            response.raise_for_status()
-            
-            one_min_response = response.json()
-            
-            # Transform to OpenAI format
-            transformed_response = {
-                "id": one_min_response.get('id', f"file-{uuid.uuid4()}"),
-                "object": "file",
-                "bytes": one_min_response.get('size', 0),
-                "created_at": one_min_response.get('created_at', int(time.time())),
-                "filename": one_min_response.get('filename', file.filename),
-                "purpose": purpose
-            }
-            
-            flask_response = make_response(jsonify(transformed_response))
-            set_response_headers(flask_response)
-            
-            return flask_response, 200
-        
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 401:
                 return ERROR_HANDLER(1020, key="[REDACTED]")
             return ERROR_HANDLER(1500, detail=str(e))
         except Exception as e:
             return ERROR_HANDLER(1500, detail=str(e))
-
-def stream_response(response, request_data, model, prompt_tokens):
-    """
-    Process streaming response from 1minAI API and convert it to OpenAI format
-    """
-    all_chunks = ""
-    for chunk in response.iter_content(chunk_size=1024):
-        if chunk:
-            chunk_text = chunk.decode('utf-8')
-            all_chunks += chunk_text
-            
-            return_chunk = {
-                "id": f"chatcmpl-{uuid.uuid4()}",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": map_model_to_openai(request_data.get('model', DEFAULT_MODEL)),
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {
-                            "content": chunk_text
-                        },
-                        "finish_reason": None
-                    }
-                ]
-            }
-            yield f"data: {json.dumps(return_chunk)}\n\n"
-    
-    # Calculate tokens from all chunks
-    completion_tokens = calculate_token(all_chunks, request_data.get('model', 'DEFAULT'))
-    logger.debug(f"Finished processing streaming response. Completion tokens: {str(completion_tokens)}")
-    logger.debug(f"Total tokens: {str(completion_tokens + prompt_tokens)}")
-    
-    # Final chunk when iteration stops
-    final_chunk = {
-        "id": f"chatcmpl-{uuid.uuid4()}",
-        "object": "chat.completion.chunk",
-        "created": int(time.time()),
-        "model": map_model_to_openai(request_data.get('model', DEFAULT_MODEL)),
-        "choices": [
-            {
-                "index": 0,
-                "delta": {},
-                "finish_reason": "stop"
-            }
-        ],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens
-        }
-    }
-    yield f"data: {json.dumps(final_chunk)}\n\n"
-    yield "data: [DONE]\n\n"
 
 def upload_file_to_1min(file_data, file_name, mime_type, api_key):
     """
@@ -2114,7 +2206,7 @@ def upload_file_to_1min(file_data, file_name, mime_type, api_key):
             'asset': (file_name, file_data, mime_type)
         }
         
-        logger.debug(f"Uploading file {file_name} to 1minAI")
+        logger.debug(f"Uploading file {file_name} to 1minAI Asset API: {ONE_MIN_ASSET_URL}")
         response = requests.post(ONE_MIN_ASSET_URL, files=files, headers=headers)
         response.raise_for_status()
         
@@ -2264,6 +2356,60 @@ def create_conversation_with_files(api_key, title, model, file_ids):
     except Exception as e:
         logger.error(f"Error creating conversation: {str(e)}")
         raise
+
+def stream_response(response, request_data, model, prompt_tokens):
+    """
+    Process streaming response from 1minAI API and convert it to OpenAI format
+    """
+    all_chunks = ""
+    for chunk in response.iter_content(chunk_size=1024):
+        if chunk:
+            chunk_text = chunk.decode('utf-8')
+            all_chunks += chunk_text
+            
+            return_chunk = {
+                "id": f"chatcmpl-{uuid.uuid4()}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": map_model_to_openai(request_data.get('model', DEFAULT_MODEL)),
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "content": chunk_text
+                        },
+                        "finish_reason": None
+                    }
+                ]
+            }
+            yield f"data: {json.dumps(return_chunk)}\n\n"
+    
+    # Calculate tokens from all chunks
+    completion_tokens = calculate_token(all_chunks, request_data.get('model', 'DEFAULT'))
+    logger.debug(f"Finished processing streaming response. Completion tokens: {str(completion_tokens)}")
+    logger.debug(f"Total tokens: {str(completion_tokens + prompt_tokens)}")
+    
+    # Final chunk when iteration stops
+    final_chunk = {
+        "id": f"chatcmpl-{uuid.uuid4()}",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": map_model_to_openai(request_data.get('model', DEFAULT_MODEL)),
+        "choices": [
+            {
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop"
+            }
+        ],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens
+        }
+    }
+    yield f"data: {json.dumps(final_chunk)}\n\n"
+    yield "data: [DONE]\n\n"
 
 # The main function to start the server
 if __name__ == "__main__":
