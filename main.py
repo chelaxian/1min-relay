@@ -30,14 +30,6 @@ import io
 import sys
 from itertools import islice
 import hashlib
-from flask_cors import CORS
-import ast
-import traceback
-import multiprocessing
-import signal
-from contextlib import contextmanager
-from functools import wraps
-import copy
 
 # Suppress warnings from flask_limiter
 warnings.filterwarnings("ignore", category=UserWarning, module="flask_limiter.extension")
@@ -107,10 +99,6 @@ def calculate_token(sentence, model="DEFAULT"):
 
 # Initialize Flask app
 app = Flask(__name__)
-
-# Включаем CORS для всех доменов
-CORS(app)
-
 if check_memcached_connection():
     limiter = Limiter(
         get_remote_address,
@@ -177,7 +165,13 @@ ALL_ONE_MIN_AVAILABLE_MODELS = [
 vision_supported_models = [
     "gpt-4o",
     "gpt-4o-mini",
-    "gpt-4-turbo"
+    "gpt-4-turbo",
+    "claude-3-5-sonnet-20240620",
+    "claude-3-opus-20240229",
+    "claude-3-sonnet-20240229",
+    "claude-3-haiku-20240307",
+    "gemini-1.5-pro",
+    "gemini-1.5-flash"
 ]
 
 # Define models that support tool use (function calling)
@@ -267,25 +261,16 @@ def ERROR_HANDLER(code, model=None, key=None, detail=None):
         1500: {"message": f"1minAI API error: {detail}", "type": "api_error", "param": None, "code": "api_error", "http_code": 500},
         1600: {"message": f"Unsupported feature: {detail}", "type": "invalid_request_error", "param": None, "code": "unsupported_feature", "http_code": 400},
         1700: {"message": f"Invalid file format: {detail}", "type": "invalid_request_error", "param": None, "code": "invalid_file_format", "http_code": 400},
-        1400: {"message": f"Invalid request format: {detail}", "type": "invalid_request_error", "param": None, "code": "invalid_request_format", "http_code": 400},
     }
     error_data = {k: v for k, v in error_codes.get(code, {"message": f"Unknown error: {detail}" if detail else "Unknown error", "type": "unknown_error", "param": None, "code": None}).items() if k != "http_code"} # Remove http_code from the error data
     logger.error(f"An error has occurred while processing the user's request. Error code: {code}")
     return jsonify({"error": error_data}), error_codes.get(code, {}).get("http_code", 400) # Return the error data without http_code inside the payload and get the http_code to return.
 
-def set_response_headers(response):
-    """Set CORS and other headers for the response"""
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-    response.headers.add('Access-Control-Allow-Credentials', 'true')
-    response.headers.add('Access-Control-Max-Age', '3600')
-    return response
-
 def handle_options_request():
-    """Handle OPTIONS request for CORS preflight"""
     response = make_response()
-    set_response_headers(response)
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
     return response, 204
 
 def extract_api_key():
@@ -294,6 +279,12 @@ def extract_api_key():
     if not auth_header or not auth_header.startswith("Bearer "):
         return None
     return auth_header.split(" ")[1]
+
+def set_response_headers(response):
+    """Set common response headers"""
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    return response
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
@@ -487,194 +478,118 @@ def extract_images_from_message(messages, api_key, model):
     
     return user_input, image_paths, image
 
-def process_tools(request_data):
-    """Process tools configuration for the request"""
-    model = request_data.get('model')
-    logger.debug(f"Processing tools for model: {model}")
+def process_tools(tools, tool_choice, model):
+    """
+    Process tools (function calling) for compatible models
     
-    # Извлечем последнее сообщение пользователя для анализа
-    user_message = ""
-    messages = request_data.get('messages', [])
-    if messages and messages[-1].get('role') == 'user':
-        user_content = messages[-1].get('content', '')
-        if isinstance(user_content, list):
-            # Для мультимодальных запросов извлекаем текст
-            user_message = ' '.join([item.get('text', '') for item in user_content if item.get('type') == 'text'])
-        else:
-            user_message = user_content
+    Args:
+        tools (list): List of tool definitions
+        tool_choice (str/dict): Tool choice configuration
+        model (str): Model name
     
-    # Проверяем явные запросы на инструменты в сообщении
-    python_keywords = ['python', 'код', 'code', 'выполни', 'запусти', 'run', 'execute']
-    search_keywords = ['поиск', 'найди', 'search', 'web', 'интернет', 'погода', 'weather']
-    
-    contains_python_request = any(kw.lower() in user_message.lower() for kw in python_keywords)
-    contains_search_request = any(kw.lower() in user_message.lower() for kw in search_keywords)
-    
-    # Логирование запросов на инструменты
-    if contains_python_request:
-        logger.info(f"Detected Python code execution request in user message")
-    if contains_search_request:
-        logger.info(f"Detected web search request in user message")
-    
-    # Списки моделей, которые поддерживают вызов инструментов
-    tool_supported_models = ["gpt-3.5-turbo-0125", "gpt-3.5-turbo", "gpt-4-turbo", "gpt-4-turbo-preview", 
-                          "gpt-4o", "gpt-4o-mini", "claude-3-opus-20240229", "claude-3-sonnet-20240229", 
-                          "claude-3-haiku-20240307", "claude-3-5-sonnet-20240620"]
-    
-    # Проверяем, есть ли явные настройки инструментов в запросе
-    tools = request_data.get('tools')
-    tool_choice = request_data.get('tool_choice')
-    
-    # Добавление инструментов на основе ключевых слов в сообщении
-    if not tools and (contains_python_request or contains_search_request):
-        tools = []
-        
-        if contains_python_request:
-            logger.info("Automatically enabling Python code execution based on user message")
-            tools.append({
-                "type": "function",
-                "function": {
-                    "name": "execute_python",
-                    "description": "Executes Python code and returns the output",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "code": {
-                                "type": "string",
-                                "description": "The Python code to execute"
-                            }
-                        },
-                        "required": ["code"]
-                    }
-                }
-            })
-        
-        if contains_search_request:
-            logger.info("Automatically enabling web search based on user message")
-            tools.append({
-                "type": "function",
-                "function": {
-                    "name": "web_search",
-                    "description": "Search the web for real-time information",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "search_term": {
-                                "type": "string",
-                                "description": "The search term to look up on the web"
-                            }
-                        },
-                        "required": ["search_term"]
-                    }
-                }
-            })
-    
-    # Если инструменты не указаны, но модель поддерживает их, добавим стандартные инструменты
-    if not tools and model in tool_supported_models:
-        logger.debug(f"Adding default tools for supported model {model}")
-        tools = [
-            {
-                "type": "function", 
-                "function": {
+    Returns:
+        dict: 1minAI compatible tools configuration
+    """
+    if not tools:
+        # Add default tools for supported models
+        if model in tools_supported_models:
+            # Default tools for all supported models
+            default_tools = [
+                {
                     "name": "get_current_datetime",
-                    "description": "Get the current date and time",
+                    "description": "Get the current date and time in various formats",
                     "parameters": {
                         "type": "object",
-                        "properties": {},
+                        "properties": {
+                            "format": {
+                                "type": "string",
+                                "description": "Date format (default: ISO format). Options: iso, rfc, human, unix"
+                            },
+                            "timezone": {
+                                "type": "string",
+                                "description": "Timezone (default: UTC). Example: Europe/London, America/New_York"
+                            }
+                        },
                         "required": []
                     }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
+                },
+                {
                     "name": "execute_python",
-                    "description": "Executes Python code and returns the output",
+                    "description": "Execute Python code and return the result",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "code": {
                                 "type": "string",
-                                "description": "The Python code to execute"
+                                "description": "Python code to execute"
+                            },
+                            "timeout": {
+                                "type": "integer",
+                                "description": "Maximum execution time in seconds (default: 10)"
                             }
                         },
                         "required": ["code"]
                     }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
+                },
+                {
                     "name": "web_search",
-                    "description": "Search the web for real-time information",
+                    "description": "Search the web for information",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "search_term": {
+                            "query": {
                                 "type": "string",
-                                "description": "The search term to look up on the web"
+                                "description": "Search query"
+                            },
+                            "num_results": {
+                                "type": "integer",
+                                "description": "Number of results to return (default: 5)"
                             }
                         },
-                        "required": ["search_term"]
+                        "required": ["query"]
                     }
                 }
-            }
-        ]
-    
-    # Если инструменты не указаны и модель не поддерживает их, вернем None
-    if not tools:
-        logger.debug(f"No tools configured for model {model}")
-        return None, None, False
-    
-    # Проверка и преобразование инструментов
-    tools_config = []
-    for tool in tools:
-        # Если инструмент в формате OpenAI, преобразуем его в формат 1minAI
-        if 'type' in tool and tool['type'] == 'function' and 'function' in tool:
-            function_info = tool['function']
-            function_name = function_info.get('name')
+            ]
             
-            if function_name:
-                logger.debug(f"Processing tool: {function_name}")
-                tools_config.append({
-                    'name': function_name,
-                    'description': function_info.get('description', ''),
-                    'parameters': function_info.get('parameters', {})
-                })
+            # Combine with any user-provided tools
+            tools = tools + default_tools if tools else default_tools
+        else:
+            # If the model does not support tools, just return None
+            logger.warning(f"Model {model} does not support tool use, ignoring tools parameter")
+            return None
+    elif model not in tools_supported_models:
+        # If the model does not support tools, just return None
+        logger.warning(f"Model {model} does not support tool use, ignoring tools parameter")
+        return None
     
-    # Обработка tool_choice
-    has_forced_tool = False
-    tool_type_mentioned = None
+    # Convert OpenAI tools format to 1minAI format
+    one_min_tools = []
     
-    # Если есть явный выбор инструмента
-    if tool_choice:
-        if tool_choice == "auto":
-            logger.debug("Using automatic tool choice")
-        elif tool_choice == "none":
-            logger.debug("Tool choice set to none, disabling tools")
-            return None, None, False
-        elif isinstance(tool_choice, dict) and 'type' in tool_choice and tool_choice['type'] == 'function':
-            # Форсируем использование конкретного инструмента
-            function_name = tool_choice.get('function', {}).get('name')
-            if function_name:
-                logger.info(f"Forcing tool choice: {function_name}")
-                has_forced_tool = True
-                tool_type_mentioned = function_name
+    for tool in tools:
+        # Currently only 'function' type is supported
+        if tool.get('type', 'function') == 'function':
+            function_def = tool.get('function', tool)  # Handle both formats
+            one_min_tool = {
+                "name": function_def.get('name', ''),
+                "description": function_def.get('description', ''),
+                "parameters": function_def.get('parameters', {})
+            }
+            one_min_tools.append(one_min_tool)
     
-    # Если нет явного выбора, но есть ключевые слова, попробуем определить инструмент
-    if not has_forced_tool:
-        if contains_python_request:
-            tool_type_mentioned = "execute_python"
-            has_forced_tool = True
-        elif contains_search_request:
-            tool_type_mentioned = "web_search"
-            has_forced_tool = True
+    # Process tool_choice
+    auto_invoke = True  # Default
+    if tool_choice == "none":
+        auto_invoke = False
+    elif isinstance(tool_choice, dict) and tool_choice.get('type') == 'function':
+        # Specific function is requested
+        # 1minAI doesn't directly support this, but we can add this to the prompt
+        pass
     
-    logger.info(f"Configured {len(tools_config)} tools for model {model}")
-    if has_forced_tool:
-        logger.info(f"Forcing tool choice: {tool_type_mentioned}")
-    
-    return tools_config, tool_type_mentioned, has_forced_tool
+    # ВАЖНО: Не включаем ссылки на функции в возвращаемый объект
+    return {
+        "tools": one_min_tools,
+        "autoInvoke": auto_invoke
+    }
 
 def handle_get_datetime(params):
     """
@@ -763,29 +678,9 @@ def handle_execute_python(params):
         if not code:
             return {"error": "No code provided"}
         
-        # Расширенное логирование
-        logger.info(f"Executing Python code with timeout {timeout}s: {code[:100]}...")
-        
         # Execute the code
         result = execute_python_code(code, timeout)
-        
-        # Детальное логирование результата
-        log_prefix = "Success" if result["status"] == "success" else "Failed"
-        logger.info(f"{log_prefix} Python execution. Return code: {result['return_code']}")
-        
-        if result["stderr"]:
-            logger.warning(f"Python execution stderr: {result['stderr'][:200]}...")
-        
-        # Добавим больше информации в ответ
-        response = {
-            "status": result["status"],
-            "output": result["stdout"],
-            "error": result["stderr"] if result["stderr"] else None,
-            "return_code": result["return_code"],
-            "execution_time": f"{timeout}s (timeout)" if result["status"] == "timeout" else None
-        }
-        
-        return response
+        return result
     except Exception as e:
         logger.error(f"Error handling execute_python tool: {str(e)}")
         return {"error": str(e)}
@@ -959,8 +854,7 @@ def process_stt_request():
 
 def web_search(query, api_key=None, num_results=5):
     """
-    Perform a web search using Google Search API with fallback to DuckDuckGo.
-    Enhanced to provide better results for weather and time-sensitive queries.
+    Perform a web search using Google Search API with fallback to DuckDuckGo
     
     Args:
         query (str): Search query
@@ -971,38 +865,19 @@ def web_search(query, api_key=None, num_results=5):
         dict: Search results
     """
     try:
-        # Enhance query for better results
-        current_date = datetime.datetime.now().strftime("%Y-%m-%d")
-        current_hour = datetime.datetime.now().strftime("%H:%M")
-        
-        # Проверяем, является ли запрос о погоде
-        weather_keywords = ['погода', 'weather', 'temperature', 'forecast', 'температура', 'прогноз']
-        is_weather_query = any(keyword in query.lower() for keyword in weather_keywords)
-        
-        # Улучшаем запрос в зависимости от типа
-        if is_weather_query:
-            # Для запросов о погоде добавляем текущую дату и время
-            enhanced_query = f"{query} {current_date} {current_hour}"
-            logger.info(f"Enhanced weather query with date and time: {enhanced_query}")
-        else:
-            # Для обычных запросов добавляем только дату
-            enhanced_query = f"{query} {current_date}"
-            logger.info(f"Enhanced search query with date: {enhanced_query}")
-        
-        # Try Google Search first if keys are available
+        # Try Google Search first
         google_api_key = os.environ.get('GOOGLE_API_KEY')
         google_cse_id = os.environ.get('GOOGLE_CSE_ID')
         
         if google_api_key and google_cse_id:
-            logger.info(f"Performing Google search for: {enhanced_query}")
+            logger.info(f"Performing Google search for: {query}")
             
             url = "https://www.googleapis.com/customsearch/v1"
             params = {
-                'q': enhanced_query,
+                'q': query,
                 'key': google_api_key,
                 'cx': google_cse_id,
-                'num': min(num_results, 10),  # Google limits to 10 results
-                'sort': 'date'  # Сортировка по дате для получения свежих результатов
+                'num': min(num_results, 10)  # Google limits to 10 results
             }
             
             response = requests.get(url, params=params)
@@ -1011,35 +886,17 @@ def web_search(query, api_key=None, num_results=5):
             
             formatted_results = []
             for item in results.get('items', []):
-                # Извлекаем дату публикации, если доступна
-                pub_date = ''
-                if 'pagemap' in item and 'metatags' in item['pagemap'] and len(item['pagemap']['metatags']) > 0:
-                    pub_date = item['pagemap']['metatags'][0].get('article:published_time', '')
-                
-                # Добавляем результат
                 formatted_results.append({
                     "title": item.get('title', ''),
                     "url": item.get('link', ''),
                     "snippet": item.get('snippet', ''),
-                    "date": pub_date
+                    "date": ''  # Google API doesn't provide dates
                 })
-            
-            # Для запросов о погоде пытаемся получить актуальные данные
-            if is_weather_query and formatted_results:
-                for result in formatted_results:
-                    # Проверяем, содержит ли сниппет числа температуры
-                    if re.search(r'[-+]?\d+°[CF]', result['snippet']) or re.search(r'[-+]?\d+\s*градус', result['snippet'].lower()):
-                        # Помечаем как высокоприоритетный результат погоды
-                        result['is_weather_data'] = True
-                        # Перемещаем в начало списка
-                        formatted_results.remove(result)
-                        formatted_results.insert(0, result)
             
             logger.info(f"Google search returned {len(formatted_results)} results")
             return {
                 "results": formatted_results,
-                "query": query,
-                "enhanced_query": enhanced_query
+                "query": query
             }
         
         # Fallback to DuckDuckGo if Google Search is not configured
@@ -1049,11 +906,7 @@ def web_search(query, api_key=None, num_results=5):
         results = []
         try:
             with DDGS() as ddgs:
-                # Определяем временной диапазон в зависимости от запроса
-                time_range = 'd' if is_weather_query else 'w'  # d = day, w = week
-                
-                # Используем timerange для получения свежих результатов
-                ddgs_results = list(ddgs.text(enhanced_query, max_results=num_results, timerange=time_range))
+                ddgs_results = list(ddgs.text(query, max_results=num_results))
                 for r in ddgs_results:
                     results.append({
                         "title": r.get('title', ''),
@@ -1061,55 +914,13 @@ def web_search(query, api_key=None, num_results=5):
                         "snippet": r.get('body', ''),
                         "date": r.get('published', '')
                     })
-                
-                # Если запрос о погоде и результатов мало, пытаемся использовать более специфичный запрос
-                if is_weather_query and len(results) < 2:
-                    specific_weather_query = query + " site:weather.com OR site:accuweather.com OR site:weatherunderground.com"
-                    logger.info(f"Using specific weather query: {specific_weather_query}")
-                    
-                    weather_results = list(ddgs.text(specific_weather_query, max_results=3, timerange='d'))
-                    for r in weather_results:
-                        results.append({
-                            "title": r.get('title', ''),
-                            "url": r.get('href', ''),
-                            "snippet": r.get('body', ''),
-                            "date": r.get('published', ''),
-                            "is_weather_data": True
-                        })
-                
-                # Если недостаточно результатов, добавляем обычный поиск
-                if len(results) < num_results:
-                    logger.info(f"Not enough recent results, adding general results for: {enhanced_query}")
-                    general_results = list(ddgs.text(enhanced_query, max_results=num_results - len(results)))
-                    for r in general_results:
-                        results.append({
-                            "title": r.get('title', ''),
-                            "url": r.get('href', ''),
-                            "snippet": r.get('body', ''),
-                            "date": r.get('published', '')
-                        })
         except Exception as ddg_err:
             logger.error(f"DuckDuckGo search error: {str(ddg_err)}")
-            # Альтернативный вариант - использовать регулярный DuckDuckGo поиск
-            try:
-                logger.info(f"Trying alternative DuckDuckGo search for: {enhanced_query}")
-                with DDGS() as ddgs:
-                    ddgs_results = list(ddgs.text(enhanced_query, max_results=num_results))
-                    for r in ddgs_results:
-                        results.append({
-                            "title": r.get('title', ''),
-                            "url": r.get('href', ''),
-                            "snippet": r.get('body', ''),
-                            "date": r.get('published', '')
-                        })
-            except Exception as alt_err:
-                logger.error(f"Alternative DuckDuckGo search also failed: {str(alt_err)}")
         
         logger.info(f"DuckDuckGo search returned {len(results)} results")
         return {
             "results": results,
-            "query": query,
-            "enhanced_query": enhanced_query
+            "query": query
         }
         
     except Exception as e:
@@ -1122,9 +933,7 @@ def web_search(query, api_key=None, num_results=5):
                 
                 results = []
                 with DDGS() as ddgs:
-                    # Используем timerange='d' для свежих результатов
-                    time_range = 'd' if is_weather_query else 'w'
-                    ddgs_results = list(ddgs.text(enhanced_query, max_results=num_results, timerange=time_range))
+                    ddgs_results = list(ddgs.text(query, max_results=num_results))
                     for r in ddgs_results:
                         results.append({
                             "title": r.get('title', ''),
@@ -1136,8 +945,7 @@ def web_search(query, api_key=None, num_results=5):
                 logger.info(f"DuckDuckGo fallback search returned {len(results)} results")
                 return {
                     "results": results,
-                    "query": query,
-                    "enhanced_query": enhanced_query
+                    "query": query
                 }
             except Exception as ddg_e:
                 logger.error(f"DuckDuckGo fallback search error: {str(ddg_e)}")
@@ -1164,263 +972,184 @@ def audio_speech():
     # request_data = request.json
     # return process_tts_request(request_data)
 
-@limiter.limit("500 per minute")
-def process_user_input(messages):
-    """
-    Process the user input from messages, extracting text and images.
-    
-    Args:
-        messages (list): List of message objects
-        
-    Returns:
-        tuple: (user_input, image_paths, has_image)
-    """
-    user_input = ""
-    image_paths = []
-    has_image = False
-    
-    # Check for empty messages
-    if not messages:
-        logger.warning("No messages provided")
-        return "", [], False
-    
-    # Get the last user message
-    last_user_message = None
-    for msg in reversed(messages):
-        if msg.get('role') == 'user':
-            last_user_message = msg
-            break
-    
-    if not last_user_message:
-        logger.warning("No user message found")
-        return "", [], False
-    
-    # Extract content from the last user message
-    content = last_user_message.get('content', '')
-    
-    # Handle multimodal content
-    if isinstance(content, list):
-        # Content is a list of objects
-        text_parts = []
-        
-        for item in content:
-            item_type = item.get('type')
-            
-            if item_type == 'text':
-                text_parts.append(item.get('text', ''))
-            elif item_type == 'image_url':
-                # Process image URL
-                image_url = item.get('image_url', {}).get('url', '')
-                if image_url.startswith('data:'):
-                    # Base64 encoded image
-                    try:
-                        # Extract content type and base64 data
-                        parts = image_url.split(',', 1)
-                        if len(parts) == 2:
-                            content_type = parts[0].split(';')[0].split(':')[1]
-                            base64_data = parts[1]
-                            
-                            # Determine file extension
-                            ext = 'jpg'  # Default
-                            if 'png' in content_type:
-                                ext = 'png'
-                            elif 'webp' in content_type:
-                                ext = 'webp'
-                            elif 'gif' in content_type:
-                                ext = 'gif'
-                            
-                            # Save image to temp file
-                            import base64
-                            import tempfile
-                            import os
-                            
-                            temp_dir = tempfile.gettempdir()
-                            temp_file = os.path.join(temp_dir, f"image_{uuid.uuid4()}.{ext}")
-                            
-                            with open(temp_file, 'wb') as f:
-                                f.write(base64.b64decode(base64_data))
-                            
-                            image_paths.append(temp_file)
-                            has_image = True
-                            logger.debug(f"Saved image to {temp_file}")
-                        else:
-                            logger.error("Invalid data URL format")
-                    except Exception as e:
-                        logger.error(f"Error processing base64 image: {str(e)}")
-                else:
-                    # URL to image - not supported in this implementation
-                    logger.warning(f"External image URLs not supported: {image_url[:30]}...")
-        
-        user_input = "\n".join(text_parts)
-    else:
-        # Content is a string
-        user_input = content
-    
-    return user_input, image_paths, has_image
-
 @app.route('/v1/chat/completions', methods=['POST', 'OPTIONS'])
 @limiter.limit("500 per minute")
 def conversation():
-    """
-    Main endpoint for the OpenAI-compatible API conversation
-    """
-    # Parse request data and validate
-    if not request.is_json:
-        return ERROR_HANDLER(1400, detail="Request must be JSON")
+    if request.method == 'OPTIONS':
+        return handle_options_request()
     
-    # Извлекаем API-ключ
     auth_header = request.headers.get('Authorization')
     if not auth_header or not auth_header.startswith("Bearer "):
         logger.error("Invalid Authentication")
         return ERROR_HANDLER(1021)
     
     api_key = auth_header.split(" ")[1]
+    request_data = request.json
     
-    # Определяем заголовки для запросов к API 1minAI
     headers = {
         "API-KEY": api_key, 
         "Content-Type": "application/json",
-        "Accept": "text/event-stream"
+        "Accept": "text/event-stream" if request_data.get('stream', False) else "application/json"
     }
-    
-    request_data = request.get_json()
-    if 'messages' not in request_data or not isinstance(request_data['messages'], list):
-        return ERROR_HANDLER(1400, detail="Missing messages field or not a list")
     
     # Get model
-    model = request_data.get('model', DEFAULT_MODEL)
-    logger.debug(f"Received conversation request for model {model}")
+    model = request_data.get('model', 'mistral-nemo')
     
-    # Clone the request data to avoid modifying the original
-    request_data_clone = copy.deepcopy(request_data)
+    # Check to see if the TTS model is a model
+    # if model in tts_supported_models:
+    #     return ERROR_HANDLER(1600, detail="TTS models can only be used with the /v1/audio/speech endpoint")
+    
+    if PERMIT_MODELS_FROM_SUBSET_ONLY and model not in AVAILABLE_MODELS:
+        return ERROR_HANDLER(1002, model)
+    
+    # Get messages
+    messages = request_data.get('messages', [])
+    if not messages:
+        return ERROR_HANDLER(1412)
+    
+    # Add system info to last user message if it was a converted DOC/DOCX file
+    last_message = messages[-1]
+    if last_message.get('role') == 'user' and 'doc_file_conversion' in request.headers:
+        original_filename = request.headers.get('doc_file_conversion')
+        # Only modify content if it's a string
+        if isinstance(last_message.get('content'), str):
+            logger.debug(f"Adding note about DOC/DOCX conversion for file: {original_filename}")
+            last_message['content'] += f"\n\n(Примечание: Этот текст был извлечен из файла {original_filename}. Некоторое форматирование могло быть потеряно при конвертации.)"
     
     # Extract system message if present
-    system_message = None
-    messages = request_data_clone.get('messages', [])
-    
-    if messages and messages[0].get('role') == 'system':
-        system_message = messages[0].get('content', '')
-        logger.debug(f"System message detected, length: {len(system_message)}")
-    
-    # Process tools configuration
-    tools_config, tool_type_mentioned, has_tools_request = process_tools(request_data_clone)
-    if tools_config:
-        logger.info(f"Adding {len(tools_config)} tools to request for model {model}")
-        if tool_type_mentioned:
-            logger.info(f"Tool type mentioned: {tool_type_mentioned}")
-    
-    # Process user input from the last user message
-    user_input, image_paths, has_image = process_user_input(messages)
-    
-    # Process multimodal content
-    if has_image:
-        logger.debug("Request contains images, processing as multimodal content")
-    
-    # Count input tokens
-    prompt_token = calculate_token(' '.join([msg.get('content', '') for msg in messages if isinstance(msg.get('content'), str)]), model)
-    
-    # Prepare final messages for 1minAI API
-    all_messages = []
+    system_prompt = None
     for msg in messages:
-        role = msg.get('role')
-        content = msg.get('content')
-        
-        # Skip system message as it's handled separately
-        if role == 'system':
-            continue
-        
-        if role == 'user' or role == 'assistant':
-            # For multimodal content
-            if isinstance(content, list):
-                # Content is a list of objects, handle text and image separately
-                msg_content = ""
-                for item in content:
-                    if item.get('type') == 'text':
-                        msg_content += item.get('text', '')
-                
-                all_messages.append({"role": role, "content": msg_content})
-            else:
-                all_messages.append({"role": role, "content": content})
-        
-        # Tool responses
-        elif role == 'tool':
-            tool_call_id = msg.get('tool_call_id')
-            name = msg.get('name')
-            content = msg.get('content')
-            
-            # Valid tool response
-            if tool_call_id and name and content:
-                all_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "name": name,
-                    "content": content
-                })
+        if msg.get('role') == 'system':
+            system_prompt = msg.get('content', '')
+            break
     
-    # Prepare 1minAI API request
-    # Convert all_messages to the right format for 1minAI API
-    processed_messages = []
-    for msg in all_messages:
-        if msg["role"] == "system":
-            # Skip system messages or handle them differently if needed
-            continue
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            # Handle multi-part content (text + images)
+    # Extract user input from the last message
+    try:
+        user_input, image_paths, has_image = extract_images_from_message(messages, api_key, model)
+    except Exception as e:
+        logger.error(f"Error extracting images: {str(e)}")
+        # If an error occurs during image processing, continue without images
+        user_input = messages[-1].get('content', '')
+        if isinstance(user_input, list):
+            # Merge the text parts of the message
             text_parts = []
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    text_parts.append(part.get("text", ""))
-            content = " ".join(text_parts)
-        processed_messages.append({
-            "role": msg["role"],
-            "content": content
-        })
+            for item in user_input:
+                if 'text' in item:
+                    text_parts.append(item['text'])
+                elif 'type' in item and item['type'] == 'text':
+                    text_parts.append(item.get('text', ''))
+            user_input = '\n'.join(text_parts)
+        
+        image_paths = []
+        has_image = False
+        
+        if not user_input:
+            return ERROR_HANDLER(1423)
     
-    # Convert to JSON string for 1minAI API
-    # Только последнее сообщение пользователя будет отправлено в API
-    user_messages = [msg for msg in processed_messages if msg["role"] == "user"]
-    if user_messages:
-        last_user_message = user_messages[-1]["content"]
-    else:
-        last_user_message = "Привет"  # Дефолтное сообщение, если не найдено сообщение пользователя
+    # Format conversation history
+    all_messages = format_conversation_history(messages, user_input, system_prompt)
+    prompt_token = calculate_token(str(all_messages))
     
+    # Process tools (function calling)
+    tools_config = None
+    try:
+        # Определяем базовый набор инструментов
+        base_tools = request_data.get('tools', [])
+        
+        # Для поддерживаемых моделей автоматически добавляем стандартные инструменты
+        if model in tools_supported_models:
+            # Добавляем стандартные инструменты, если они не указаны явно
+            standard_tools = [
+                {"type": "function", "function": {"name": "get_datetime", "description": "Get current date and time"}},
+                {"type": "function", "function": {"name": "execute_python", "description": "Execute Python code"}},
+                {"type": "function", "function": {"name": "web_search", "description": "Search the web"}}
+            ]
+            
+            # Если инструменты не заданы, используем стандартные
+            if not base_tools:
+                base_tools = standard_tools
+            # Иначе добавляем стандартные, если их еще нет
+            else:
+                existing_tool_names = [t.get('function', {}).get('name', '') for t in base_tools if t.get('type') == 'function']
+                for std_tool in standard_tools:
+                    if std_tool['function']['name'] not in existing_tool_names:
+                        base_tools.append(std_tool)
+            
+            tools_config = process_tools(
+                base_tools,
+                request_data.get('tool_choice', 'auto'),
+                model
+            )
+            logger.info(f"Added tools configuration for supported model {model}: {[t.get('function', {}).get('name', '') for t in base_tools if t.get('type') == 'function']}")
+        else:
+            # Для неподдерживаемых моделей пробуем обработать только явно указанные инструменты
+            if base_tools:
+                try:
+                    tools_config = process_tools(
+                        base_tools,
+                        request_data.get('tool_choice', 'auto'),
+                        model
+                    )
+                    logger.warning(f"Processing tools for potentially unsupported model {model}")
+                except Exception as tool_e:
+                    logger.warning(f"Failed to process tools for model {model}: {str(tool_e)}")
+                    # Продолжаем без инструментов
+                    pass
+    except Exception as e:
+        logger.error(f"Error processing tools: {str(e)}")
+        # Продолжаем без инструментов при ошибке
+        pass
+    
+    # Check for web search
+    use_web_search = request_data.get('web_search', False)
+    # Автоматически включаем веб-поиск для поддерживаемых моделей, если в запросе есть ключевые слова
+    if model in web_search_supported_models and not use_web_search:
+        # Проверяем наличие ключевых слов для поиска в интернете
+        search_keywords = ['найди', 'поищи', 'search', 'найти', 'поиск', 'погугли', 'загугли']
+        content = messages[-1].get('content', '')
+        
+        # Проверка типа контента и обработка соответствующим образом
+        if isinstance(content, list):
+            # Для мультимодального контента извлекаем текст
+            text_parts = []
+            for item in content:
+                if isinstance(item, dict) and 'text' in item:
+                    text_parts.append(item['text'])
+                elif isinstance(item, dict) and item.get('type') == 'text':
+                    text_parts.append(item.get('text', ''))
+            user_message = ' '.join(text_parts).lower()
+        else:
+            # Для обычного текстового контента
+            user_message = content.lower()
+            
+        if any(keyword in user_message for keyword in search_keywords):
+            use_web_search = True
+            logger.info(f"Automatically enabling web search for model {model} based on user message")
+    
+    if use_web_search and model not in web_search_supported_models:
+        logger.warning(f"Model {model} does not support web search, ignoring web search parameter")
+        use_web_search = False
+    
+    # Prepare base payload
     payload = {
-        "type": "CHAT_WITH_AI",
         "model": model,
         "promptObject": {
-            "prompt": last_user_message,
+            "prompt": all_messages,
             "isMixed": False,
-            "webSearch": False
+            "webSearch": use_web_search
         }
     }
-    
-    # Добавляем webSearch: true если используется инструмент web_search
-    if any(tool.get("name") == "get_search_results" for tool in tools_config):
-        payload["promptObject"]["webSearch"] = True
-        payload["promptObject"]["numOfSite"] = 3
-        payload["promptObject"]["maxWord"] = 1000
-        logger.debug("Enabling web search in the request")
     
     # Set request type based on content
     if has_image:
         payload["type"] = "CHAT_WITH_IMAGE"
         payload["promptObject"]["imageList"] = image_paths
+    else:
+        payload["type"] = "CHAT_WITH_AI"
     
     # Add tools if configured
     if tools_config:
-        payload["toolsConfig"] = {
-            "tools": tools_config
-        }
-        
-        # Add tool_choice if specified
-        if tool_type_mentioned:
-            payload["toolsConfig"]["tool_choice"] = {
-                "type": "function",
-                "function": {"name": tool_type_mentioned}
-            }
-        
-        logger.debug(f"Adding tools configuration to payload: {json.dumps(payload['toolsConfig'])}")
+        payload["toolsConfig"] = tools_config
     
     # Add additional parameters
     if 'temperature' in request_data:
@@ -1453,93 +1182,54 @@ def conversation():
         # Non-Streaming Response
         logger.debug("Non-Streaming AI Response")
         try:
-            # Логирование полного запроса для отладки
-            if has_tools_request:
-                tools_part = payload.get("toolsConfig", {})
-                logger.info(f"Sending request with tools for {tool_type_mentioned}: {json.dumps(tools_part)}")
-            
             response = requests.post(ONE_MIN_API_URL, json=payload, headers=headers)
             response.raise_for_status()
             one_min_response = response.json()
             
-            # Логирование ответа API и проверка наличия вызовов инструментов
-            if 'function_call' in one_min_response or 'tool_calls' in one_min_response:
-                logger.info("Response contains function/tool calls!")
-                if 'function_call' in one_min_response:
-                    logger.info(f"Function call: {json.dumps(one_min_response['function_call'])}")
-                if 'tool_calls' in one_min_response:
-                    logger.info(f"Tool calls: {json.dumps(one_min_response['tool_calls'])}")
-            elif has_tools_request:
-                logger.warning(f"Request mentioned {tool_type_mentioned} but response doesn't contain any tool calls")
-            
             transformed_response = transform_response(one_min_response, request_data, prompt_token)
             flask_response = make_response(jsonify(transformed_response))
-            return set_response_headers(flask_response)
+            set_response_headers(flask_response)
             
-        except requests.RequestException as e:
-            logger.error(f"Error with 1minAI API: {str(e)}")
+            return flask_response, 200
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 401:
+                return ERROR_HANDLER(1020, key="[REDACTED]")
             return ERROR_HANDLER(1500, detail=str(e))
+    
     else:
         # Streaming Response
         logger.debug("Streaming AI Response")
         try:
-            # Логирование полного запроса для отладки
-            if has_tools_request:
-                tools_part = payload.get("toolsConfig", {})
-                logger.info(f"Sending streaming request with tools for {tool_type_mentioned}: {json.dumps(tools_part)}")
-                
-            def generate():
-                response = requests.post(ONE_MIN_CONVERSATION_API_STREAMING_URL, json=payload, headers=headers, stream=True)
-                
-                if response.status_code != 200:
-                    logger.warning(f"Streaming request failed for model {model}, trying non-streaming mode")
-                    non_streaming_response = requests.post(ONE_MIN_API_URL, json=payload, headers=headers)
-                    non_streaming_response.raise_for_status()
-                    one_min_response = non_streaming_response.json()
-                    transformed_response = transform_response(one_min_response, request_data, prompt_token)
-                    
-                    # Формируем ответ как событие SSE
-                    yield f"data: {json.dumps(transformed_response)}\n\n"
-                    yield f"data: [DONE]\n\n"
-                    return
-                
-                # Обработка потокового ответа
-                for line in response.iter_lines():
-                    if line:
-                        line = line.decode('utf-8')
-                        if line.startswith('data: '):
-                            data = line[6:]  # Удаляем префикс "data: "
-                            if data == "[DONE]":
-                                yield f"data: [DONE]\n\n"
-                                break
-                            
-                            try:
-                                chunk = json.loads(data)
-                                # Проверяем наличие вызовов инструментов в потоковом ответе
-                                if 'function_call' in chunk or 'tool_calls' in chunk:
-                                    logger.info("Streaming response contains function/tool calls!")
-                                    if 'function_call' in chunk:
-                                        logger.info(f"Function call in stream: {json.dumps(chunk['function_call'])}")
-                                    if 'tool_calls' in chunk:
-                                        logger.info(f"Tool calls in stream: {json.dumps(chunk['tool_calls'])}")
-                                
-                                transformed_chunk = transform_streaming_response(chunk, request_data, model)
-                                yield f"data: {json.dumps(transformed_chunk)}\n\n"
-                            except json.JSONDecodeError as e:
-                                logger.error(f"Error parsing streaming response: {str(e)}")
-                                logger.error(f"Raw data: {data}")
-                                
-                # Проверка отсутствия вызовов инструментов в конце потока
-                if has_tools_request:
-                    logger.warning(f"Streaming request mentioned {tool_type_mentioned} but no tool calls were received in the stream")
+            response_stream = requests.post(ONE_MIN_CONVERSATION_API_STREAMING_URL, 
+                                           data=json.dumps(payload), 
+                                           headers=headers, 
+                                           stream=True)
+            response_stream.raise_for_status()
             
-            return Response(generate(), mimetype='text/event-stream')
+            return Response(stream_response(response_stream, request_data, request_data.get('model', DEFAULT_MODEL), prompt_token), 
+                            mimetype='text/event-stream')
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 401:
+                return ERROR_HANDLER(1020, key="[REDACTED]")
             
-        except requests.RequestException as e:
-            logger.error(f"Error with 1minAI API streaming: {str(e)}")
-            return ERROR_HANDLER(1500, detail=str(e))
+            # If you get an error while streaming, try without streaming
+            logger.warning(f"Streaming request failed for model {model}, trying non-streaming mode")
+            try:
+                response = requests.post(ONE_MIN_API_URL, json=payload, headers=headers)
+                response.raise_for_status()
+                one_min_response = response.json()
+                
+                transformed_response = transform_response(one_min_response, request_data, prompt_token)
+                flask_response = make_response(jsonify(transformed_response))
+                set_response_headers(flask_response)
+                
+                return flask_response, 200
+            except requests.exceptions.HTTPError as retry_e:
+                if retry_e.response.status_code == 401:
+                    return ERROR_HANDLER(1020, key="[REDACTED]")
+                return ERROR_HANDLER(1500, detail=str(retry_e))
+            
         except Exception as e:
-            logger.error(f"Error with 1minAI API streaming: {str(e)}")
             return ERROR_HANDLER(1500, detail=str(e))
 
 def transform_streaming_response(data, request_data, last_output, prompt_tokens):
@@ -1705,155 +1395,132 @@ def transform_streaming_response(data, request_data, last_output, prompt_tokens)
     transformed_response["choices"] = choices
     return transformed_response
 
-def transform_response(response_data, request_data, prompt_token=0):
-    """
-    Transform 1minAI response to OpenAI format
-    """
+# Add a function to transform the response from 1minAI API into OpenAI API format
+def transform_response(one_min_response, request_data, prompt_tokens):
+    """Transform 1minAI response format to OpenAI format"""
+    current_time = int(time.time())
+    completion_id = f"chatcmpl-{uuid.uuid4()}"
+    model = map_model_to_openai(request_data.get('model', DEFAULT_MODEL))
+    
+    # Initialize transformed response
     transformed_response = {
-        "id": "chatcmpl-" + str(uuid.uuid4()),
+        "id": completion_id,
         "object": "chat.completion",
-        "created": int(time.time()),
-        "model": request_data.get('model', DEFAULT_MODEL),
-        "choices": [{
+        "created": current_time,
+        "model": model,
+        "choices": [],
+        "usage": {}
+    }
+    
+    # Extract content from 1minAI response
+    content = one_min_response.get('content', '')
+    
+    # Handle tool calls if present
+    if 'function_call' in one_min_response or 'tool_calls' in one_min_response:
+        tool_calls = []
+        
+        # Convert old function_call format to new tool_calls
+        if 'function_call' in one_min_response:
+            tool_calls = [{
+                'name': one_min_response['function_call'].get('name', ''),
+                'arguments': one_min_response['function_call'].get('arguments', '{}'),
+                'id': f"call_{uuid.uuid4()}"
+            }]
+        else:
+            tool_calls = one_min_response.get('tool_calls', [])
+            for call in tool_calls:
+                if 'id' not in call:
+                    call['id'] = f"call_{uuid.uuid4()}"
+        
+        # Process each tool call
+        processed_calls = []
+        for tool_call in tool_calls:
+            function_name = tool_call.get('name', '')
+            function_args = tool_call.get('arguments', '{}')
+            call_id = tool_call.get('id')
+            
+            # Prepare arguments
+            try:
+                args = json.loads(function_args) if isinstance(function_args, str) else function_args
+            except json.JSONDecodeError:
+                logger.error(f"Invalid JSON in arguments for {function_name}: {function_args}")
+                args = {}
+            
+            # Process with appropriate handler
+            result = None
+            try:
+                if function_name == 'get_datetime':
+                    result = handle_get_datetime(args)
+                elif function_name == 'execute_python':
+                    result = handle_execute_python(args)
+                elif function_name == 'web_search':
+                    result = handle_web_search(args)
+                else:
+                    logger.warning(f"Unknown function {function_name}")
+                    result = {"error": f"Unknown function {function_name}"}
+            except Exception as e:
+                logger.error(f"Error handling function {function_name}: {str(e)}")
+                result = {"error": str(e)}
+            
+            processed_calls.append({
+                "call": {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": function_name,
+                        "arguments": json.dumps(args)
+                    }
+                },
+                "result": result
+            })
+        
+        # Create response with tool calls
+        choice = {
             "index": 0,
             "message": {
                 "role": "assistant",
                 "content": None,
+                "tool_calls": [pc["call"] for pc in processed_calls]
+            },
+            "finish_reason": "tool_calls"
+        }
+        transformed_response["choices"].append(choice)
+        
+        # Add tool call results
+        for i, pc in enumerate(processed_calls):
+            if pc["result"]:
+                result_choice = {
+                    "index": i + 1,
+                    "message": {
+                        "role": "tool",
+                        "tool_call_id": pc["call"]["id"],
+                        "name": pc["call"]["function"]["name"],
+                        "content": json.dumps(pc["result"])
+                    },
+                    "finish_reason": "tool_result"
+                }
+                transformed_response["choices"].append(result_choice)
+    else:
+        # Regular text response
+        choice = {
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": content
             },
             "finish_reason": "stop"
-        }],
-        "usage": {
-            "prompt_tokens": prompt_token,
-            "completion_tokens": 0,
-            "total_tokens": prompt_token
         }
+        transformed_response["choices"].append(choice)
+    
+    # Calculate completion tokens
+    completion_tokens = calculate_token(content, request_data.get('model', 'DEFAULT'))
+    
+    # Add usage information
+    transformed_response["usage"] = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens
     }
-    
-    # Extract content from 1minAI response
-    if "choices" in response_data and len(response_data["choices"]) > 0:
-        if "message" in response_data["choices"][0]:
-            content = response_data["choices"][0]["message"].get("content")
-            transformed_response["choices"][0]["message"]["content"] = content
-    elif "content" in response_data:
-        content = response_data.get("content")
-        transformed_response["choices"][0]["message"]["content"] = content
-    
-    logger.debug(f"Response received, preparing transformation to OpenAI format")
-    
-    # Handle function/tool calls if present
-    tool_calls = []
-    
-    # Check for old function call format
-    if "function_call" in response_data:
-        logger.info(f"Old function call format detected: {json.dumps(response_data['function_call'])}")
-        # Convert old function call to new tool call
-        function_call = response_data["function_call"]
-        if "name" in function_call and "arguments" in function_call:
-            try:
-                # Try to parse the arguments as JSON
-                arguments = json.loads(function_call["arguments"])
-                logger.info(f"Function {function_call['name']} arguments parsed successfully")
-            except json.JSONDecodeError as e:
-                logger.error(f"Error parsing function arguments: {str(e)}")
-                # If parsing fails, use the raw string
-                arguments = function_call["arguments"]
-            
-            tool_call = {
-                "id": "call_" + str(uuid.uuid4()),
-                "type": "function",
-                "function": {
-                    "name": function_call["name"],
-                    "arguments": function_call["arguments"]
-                }
-            }
-            tool_calls.append(tool_call)
-            
-            logger.info(f"Converted function call to tool call: {json.dumps(tool_call)}")
-    
-    # Check for new tool calls format
-    if "tool_calls" in response_data:
-        logger.info(f"New tool calls format detected: {json.dumps(response_data['tool_calls'])}")
-        for tool_call in response_data["tool_calls"]:
-            if "function" in tool_call:
-                tool_calls.append(tool_call)
-    
-    # Process tool calls if present
-    if tool_calls:
-        processed_tool_calls = []
-        
-        for tool_call in tool_calls:
-            if "function" in tool_call:
-                function_name = tool_call["function"]["name"]
-                arguments_str = tool_call["function"]["arguments"]
-                
-                logger.info(f"Processing tool call for function: {function_name}")
-                
-                try:
-                    # Try to parse the arguments as JSON
-                    arguments = json.loads(arguments_str)
-                    logger.debug(f"Arguments parsed successfully: {json.dumps(arguments)}")
-                except json.JSONDecodeError as e:
-                    logger.error(f"Error parsing arguments: {str(e)}")
-                    # If parsing fails, use the raw string
-                    arguments = arguments_str
-                
-                # Execute the function call based on the function name
-                if function_name == "execute_python":
-                    logger.info(f"Executing Python code, length: {len(arguments.get('code', ''))}")
-                    start_time = time.time()
-                    try:
-                        result = execute_python_code(arguments.get("code", ""))
-                        execution_time = time.time() - start_time
-                        logger.info(f"Python execution completed in {execution_time:.2f}s, output length: {len(result)}")
-                    except Exception as e:
-                        logger.error(f"Error executing Python code: {str(e)}")
-                        result = f"Error: {str(e)}"
-                    
-                    tool_call["function"]["output"] = result
-                    processed_tool_calls.append(tool_call)
-                
-                elif function_name == "web_search":
-                    logger.info(f"Performing web search for query: {arguments.get('search_term', '')}")
-                    
-                    try:
-                        # Извлечение API ключа DuckDuckGo из переменных окружения
-                        ddg_api_key = os.environ.get("DUCKDUCKGO_API_KEY")
-                        if not ddg_api_key:
-                            logger.warning("DuckDuckGo API key not found in environment variables")
-                        
-                        start_time = time.time()
-                        search_results = web_search(arguments.get("search_term", ""))
-                        execution_time = time.time() - start_time
-                        
-                        logger.info(f"Web search completed in {execution_time:.2f}s, found {len(search_results)} results")
-                        
-                        # Преобразуем результаты в строку JSON для вывода
-                        result = json.dumps(search_results, ensure_ascii=False)
-                        
-                        tool_call["function"]["output"] = result
-                        processed_tool_calls.append(tool_call)
-                    except Exception as e:
-                        logger.error(f"Error performing web search: {str(e)}")
-                        tool_call["function"]["output"] = f"Error: {str(e)}"
-                        processed_tool_calls.append(tool_call)
-                
-                else:
-                    logger.warning(f"Unknown function: {function_name}")
-                    tool_call["function"]["output"] = f"Error: Unknown function {function_name}"
-                    processed_tool_calls.append(tool_call)
-        
-        # Add the processed tool calls to the response
-        if processed_tool_calls:
-            logger.info(f"Adding {len(processed_tool_calls)} processed tool calls to response")
-            transformed_response["choices"][0]["message"]["tool_calls"] = processed_tool_calls
-            transformed_response["choices"][0]["finish_reason"] = "tool_calls"
-    
-    # Handle usage information if available
-    if "usage" in response_data:
-        usage = response_data["usage"]
-        if "completion_tokens" in usage:
-            transformed_response["usage"]["completion_tokens"] = usage["completion_tokens"]
-            transformed_response["usage"]["total_tokens"] = prompt_token + usage["completion_tokens"]
     
     return transformed_response
 
@@ -2417,208 +2084,100 @@ def upload_file_to_1min(file_data, file_name, mime_type, api_key):
         logger.error(f"Error uploading file: {str(e)}")
         raise
 
-class CodeSecurityChecker(ast.NodeVisitor):
+def execute_python_code(code, timeout=10):
     """
-    Проверяет Python-код на наличие потенциально опасных операций.
-    """
-    
-    def __init__(self):
-        self.has_dangerous_operations = False
-        self.dangerous_operations = []
-    
-    def visit_Import(self, node):
-        dangerous_modules = [
-            'os', 'subprocess', 'sys', 'shutil', 
-            'pathlib', 'pickle', 'marshal', 'socket',
-            'multiprocessing', 're', 'tempfile',
-            'glob', 'ftplib', 'smtplib', 'winreg'
-        ]
-        
-        for name in node.names:
-            if name.name in dangerous_modules:
-                self.has_dangerous_operations = True
-                self.dangerous_operations.append(f"Importing dangerous module: {name.name}")
-        self.generic_visit(node)
-    
-    def visit_ImportFrom(self, node):
-        dangerous_modules = [
-            'os', 'subprocess', 'sys', 'shutil', 
-            'pathlib', 'pickle', 'marshal', 'socket',
-            'multiprocessing', 're', 'tempfile',
-            'glob', 'ftplib', 'smtplib', 'winreg'
-        ]
-        
-        if node.module in dangerous_modules:
-            self.has_dangerous_operations = True
-            self.dangerous_operations.append(f"Importing from dangerous module: {node.module}")
-        self.generic_visit(node)
-    
-    def visit_Call(self, node):
-        dangerous_functions = [
-            'exec', 'eval', 'compile', 'open', 'input', 
-            '__import__', 'getattr', 'setattr', 'delattr'
-        ]
-        
-        # Проверяем вызов функции
-        if isinstance(node.func, ast.Name) and node.func.id in dangerous_functions:
-            self.has_dangerous_operations = True
-            self.dangerous_operations.append(f"Calling dangerous function: {node.func.id}")
-        
-        # Проверяем атрибуты объектов
-        elif isinstance(node.func, ast.Attribute):
-            dangerous_methods = [
-                'system', 'popen', 'spawn', 'call', 'check_output', 
-                'check_call', 'open', 'read', 'write', 'remove', 
-                'rmdir', 'mkdir', 'chdir', 'delete', 'unlink', 
-                'makedirs', 'chmod', 'chown', 'rename', 'loadtxt', 
-                'savetxt', 'load', 'dump', 'loads', 'dumps'
-            ]
-            
-            if node.func.attr in dangerous_methods:
-                self.has_dangerous_operations = True
-                self.dangerous_operations.append(f"Calling dangerous method: {node.func.attr}")
-        
-        self.generic_visit(node)
-
-@contextmanager
-def time_limit(seconds):
-    """
-    Контекстный менеджер для ограничения времени выполнения кода.
+    Execute Python code in a safe environment with timeout
     
     Args:
-        seconds (int): максимальное время выполнения в секундах
-    """
-    def signal_handler(signum, frame):
-        raise TimeoutError("Code execution timed out")
+        code (str): Python code to execute
+        timeout (int): Maximum execution time in seconds
     
-    previous_handler = signal.signal(signal.SIGALRM, signal_handler)
-    signal.alarm(seconds)
-    
-    try:
-        yield
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, previous_handler)
-
-def execute_python_code(code):
-    """
-    Безопасно выполняет Python-код с ограничением времени и проверками безопасности.
-    
-    Args:
-        code (str): Python-код для выполнения
-        
     Returns:
-        dict: результат выполнения кода (результат, статус, ошибка если есть)
+        dict: Execution result with stdout, stderr and execution status
     """
-    # Проверка безопасности кода
     try:
-        parsed_ast = ast.parse(code)
-        security_checker = CodeSecurityChecker()
-        security_checker.visit(parsed_ast)
+        logger.info(f"Executing Python code: {code[:100]}{'...' if len(code) > 100 else ''}")
         
-        if security_checker.has_dangerous_operations:
-            logger.warning(f"Потенциально опасный код обнаружен: {security_checker.dangerous_operations}")
-            return {
-                "result": None,
-                "status": "error",
-                "error": f"Код содержит потенциально опасные операции: {', '.join(security_checker.dangerous_operations)}"
+        # Create a string buffer to capture output
+        output = io.StringIO()
+        error = io.StringIO()
+        
+        # Redirect stdout and stderr
+        sys.stdout = output
+        sys.stderr = error
+        
+        # Create safe globals
+        safe_globals = {
+            '__builtins__': {
+                name: getattr(__builtins__, name)
+                for name in ['abs', 'all', 'any', 'ascii', 'bin', 'bool', 'bytearray', 'bytes',
+                             'chr', 'complex', 'dict', 'dir', 'divmod', 'enumerate', 'filter',
+                             'float', 'format', 'frozenset', 'hash', 'hex', 'int', 'isinstance',
+                             'issubclass', 'iter', 'len', 'list', 'map', 'max', 'min', 'next',
+                             'object', 'oct', 'ord', 'pow', 'print', 'range', 'repr', 'reversed',
+                             'round', 'set', 'slice', 'sorted', 'str', 'sum', 'tuple', 'type',
+                             'zip']
             }
-    except SyntaxError as e:
-        logger.error(f"Синтаксическая ошибка в коде: {str(e)}")
-        return {
-            "result": None,
-            "status": "error",
-            "error": f"Синтаксическая ошибка: {str(e)}"
         }
-    
-    # Подготовка для перехвата stdout/stderr
-    stdout_capture = io.StringIO()
-    stderr_capture = io.StringIO()
-    
-    # Создаем временное окружение для выполнения
-    execution_environment = {'__builtins__': __builtins__}
-    
-    # Функция выполнения в отдельном процессе
-    def execute_in_subprocess(code, result_queue):
+        
+        # Add some safe modules
+        for module_name in ['math', 'random', 'datetime', 're', 'json', 'collections']:
+            try:
+                safe_globals[module_name] = __import__(module_name)
+            except ImportError:
+                pass
+        
+        # Execute the code
         try:
-            # Перенаправляем вывод
-            sys.stdout = stdout_capture
-            sys.stderr = stderr_capture
+            # Create a thread to execute the code with timeout
+            def exec_code():
+                exec(code, safe_globals, {})
             
-            # Выполняем код
-            exec(code, execution_environment)
+            import threading
+            thread = threading.Thread(target=exec_code)
+            thread.daemon = True
             
-            # Получаем результаты
-            stdout_output = stdout_capture.getvalue()
-            stderr_output = stderr_capture.getvalue()
+            thread.start()
+            thread.join(timeout)
             
-            # Помещаем результаты в очередь
-            result_queue.put({
-                "result": stdout_output,
-                "error": stderr_output if stderr_output else None,
-                "status": "success" if not stderr_output else "warning"
-            })
+            if thread.is_alive():
+                # Timeout occurred
+                logger.warning(f"Python code execution timed out after {timeout} seconds")
+                return {
+                    "status": "timeout",
+                    "stdout": output.getvalue(),
+                    "stderr": f"Execution timed out after {timeout} seconds",
+                    "return_code": -1
+                }
+            
+            result = {
+                "status": "success",
+                "stdout": output.getvalue(),
+                "stderr": error.getvalue(),
+                "return_code": 0
+            }
+            logger.info(f"Python code executed successfully: {result['stdout'][:100]}{'...' if len(result['stdout']) > 100 else ''}")
         except Exception as e:
-            error_message = f"{type(e).__name__}: {str(e)}"
-            traceback_str = traceback.format_exc()
-            result_queue.put({
-                "result": stdout_capture.getvalue(),
-                "error": error_message,
-                "traceback": traceback_str,
-                "status": "error"
-            })
-        finally:
-            # Восстанавливаем стандартные выводы
-            sys.stdout = sys.__stdout__
-            sys.stderr = sys.__stderr__
-    
-    # Запускаем выполнение с ограничением времени
-    try:
-        # Создаем очередь для получения результатов
-        result_queue = multiprocessing.Queue()
-        
-        # Создаем и запускаем процесс
-        process = multiprocessing.Process(
-            target=execute_in_subprocess,
-            args=(code, result_queue)
-        )
-        
-        # Запускаем процесс с ограничением времени
-        process.start()
-        
-        # Ждем выполнения в течение 10 секунд
-        process.join(10)
-        
-        # Проверяем, завершился ли процесс
-        if process.is_alive():
-            # Если процесс все еще работает, завершаем его
-            process.terminate()
-            process.join()
-            
-            logger.warning("Код выполнялся слишком долго и был прерван")
-            return {
-                "result": stdout_capture.getvalue(),
+            result = {
                 "status": "error",
-                "error": "Превышено время выполнения (10 секунд)"
+                "stdout": output.getvalue(),
+                "stderr": str(e),
+                "return_code": -1
             }
         
-        # Получаем результат выполнения
-        if not result_queue.empty():
-            result = result_queue.get()
-            return result
-        else:
-            return {
-                "result": None,
-                "status": "error",
-                "error": "Не удалось получить результат выполнения"
-            }
-            
+        # Restore stdout and stderr
+        sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
+        
+        return result
+        
     except Exception as e:
-        logger.error(f"Ошибка при выполнении кода: {str(e)}")
+        logger.error(f"Error executing Python code: {str(e)}")
         return {
-            "result": None,
             "status": "error",
-            "error": f"Ошибка выполнения: {str(e)}"
+            "stdout": "",
+            "stderr": str(e),
+            "return_code": -1
         }
 
 def create_conversation_with_files(api_key, title, model, file_ids):
@@ -2659,142 +2218,13 @@ def create_conversation_with_files(api_key, title, model, file_ids):
         logger.error(f"Error creating conversation: {str(e)}")
         raise
 
-@app.route('/', methods=['POST'])
-def relay():
-    """
-    Main handler for API requests
-    """
-    start_time = datetime.datetime.now()
-    response_data = {
-        "status": "error",
-        "message": "Unknown error occurred",
-        "data": None,
-        "processing_time": None
-    }
+# The main function to start the server
+if __name__ == "__main__":
+    # Set the logging level
+    if os.environ.get('DEBUG') == 'True':
+        logging.getLogger().setLevel(logging.DEBUG)
+    else:
+        logging.getLogger().setLevel(logging.INFO)
     
-    try:
-        data = request.get_json()
-        if not data:
-            response_data["message"] = "No data provided"
-            return jsonify(response_data)
-        
-        query = data.get("query", "")
-        api_key = data.get("api_key", "")
-        model = data.get("model", DEFAULT_MODEL)
-        language = data.get("language", "en")
-        tool = data.get("tool", "")
-        
-        if not query and not tool:
-            response_data["message"] = "No query or tool specified"
-            return jsonify(response_data)
-        
-        # Определяем, какой инструмент использовать
-        if tool == "web_search":
-            result = web_search(query, api_key)
-            response_data["status"] = "success"
-            response_data["data"] = result
-            response_data["message"] = "Web search completed successfully"
-        elif tool == "execute_python":
-            code = data.get("code", "")
-            if not code:
-                response_data["message"] = "No code provided for execution"
-                return jsonify(response_data)
-            
-            result = execute_python_code(code)
-            response_data["status"] = "success"
-            response_data["data"] = result
-            response_data["message"] = "Python code executed successfully"
-        else:
-            response_data["message"] = f"Unknown tool: {tool}"
-            
-    except Exception as e:
-        logger.error(f"Error in relay: {str(e)}")
-        response_data["message"] = f"Error: {str(e)}"
-        
-    finally:
-        end_time = datetime.datetime.now()
-        processing_time = (end_time - start_time).total_seconds()
-        response_data["processing_time"] = processing_time
-        logger.info(f"Request processed in {processing_time:.2f} seconds")
-        
-        response = jsonify(response_data)
-        return set_response_headers(response)
-
-@app.route('/api/tools', methods=['POST', 'OPTIONS'])
-def tools_endpoint():
-    """
-    Эндпоинт для прямого выполнения инструментов через HTTP API
-    """
-    if request.method == 'OPTIONS':
-        return handle_options_request()
-    
-    start_time = datetime.datetime.now()
-    response_data = {
-        "status": "error",
-        "message": "Unknown error occurred",
-        "data": None,
-        "processing_time": None
-    }
-    
-    try:
-        data = request.get_json()
-        if not data:
-            response_data["message"] = "No data provided"
-            return jsonify(response_data)
-        
-        tool = data.get("tool", "")
-        if not tool:
-            response_data["message"] = "No tool specified"
-            return jsonify(response_data)
-        
-        query = data.get("query", "")
-        code = data.get("code", "")
-        api_key = data.get("api_key", "")
-        
-        # Определяем, какой инструмент использовать
-        if tool == "web_search":
-            if not query:
-                response_data["message"] = "No query provided for web search"
-                return jsonify(response_data)
-            
-            logger.info(f"Processing web_search request for query: {query}")
-            result = web_search(query, api_key)
-            response_data["status"] = "success"
-            response_data["data"] = result
-            response_data["message"] = "Web search completed successfully"
-            
-        elif tool == "execute_python":
-            if not code:
-                response_data["message"] = "No code provided for execution"
-                return jsonify(response_data)
-            
-            logger.info(f"Processing execute_python request: {code[:50]}...")
-            result = execute_python_code(code)
-            response_data["status"] = "success"
-            response_data["data"] = result
-            response_data["message"] = "Python code executed successfully"
-            
-        else:
-            response_data["message"] = f"Unknown tool: {tool}"
-            
-    except Exception as e:
-        logger.error(f"Error in tools_endpoint: {str(e)}")
-        response_data["message"] = f"Error: {str(e)}"
-        
-    finally:
-        end_time = datetime.datetime.now()
-        processing_time = (end_time - start_time).total_seconds()
-        response_data["processing_time"] = processing_time
-        logger.info(f"Tools request processed in {processing_time:.2f} seconds")
-        
-        response = jsonify(response_data)
-        return set_response_headers(response)
-
-def main():
     # Start the server
     app.run(host="0.0.0.0", port=PORT, debug=DEBUG_MODE)
-
-# Запуск приложения
-if __name__ == "__main__":
-    main()
-
