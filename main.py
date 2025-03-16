@@ -972,12 +972,10 @@ def audio_transcriptions():
 def audio_speech():
     if request.method == 'OPTIONS':
         return handle_options_request()
-    
+    request_data = request.json
+    return process_tts_request(request_data)    
     # Temporarily return an error that the function is disabled
-    return ERROR_HANDLER(1600, detail="TTS functionality is temporarily disabled")
-    
-    # request_data = request.json
-    # return process_tts_request(request_data)
+    # return ERROR_HANDLER(1600, detail="TTS functionality is temporarily disabled")
 
 @app.route('/v1/chat/completions', methods=['POST', 'OPTIONS'])
 @limiter.limit("500 per minute")
@@ -1003,8 +1001,8 @@ def conversation():
     model = request_data.get('model', 'mistral-nemo')
     
     # Check to see if the TTS model is a model
-    # if model in tts_supported_models:
-    #     return ERROR_HANDLER(1600, detail="TTS models can only be used with the /v1/audio/speech endpoint")
+    if model in tts_supported_models:
+        return ERROR_HANDLER(1600, detail="TTS models can only be used with the /v1/audio/speech endpoint")
     
     if PERMIT_MODELS_FROM_SUBSET_ONLY and model not in AVAILABLE_MODELS:
         return ERROR_HANDLER(1002, model)
