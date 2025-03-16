@@ -154,6 +154,13 @@ ALL_ONE_MIN_AVAILABLE_MODELS = [
     "mistral-nemo",
     "open-mistral-7b",
 
+    #"nova", 
+    #"alloy", 
+    #"echo", 
+    #"fable", 
+    #"onyx", 
+    #"shimmer"
+    
    # Replicate
    "meta/llama-2-70b-chat", 
    "meta/meta-llama-3-70b-instruct", 
