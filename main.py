@@ -31,6 +31,12 @@ import sys
 from itertools import islice
 import hashlib
 from flask_cors import CORS
+import ast
+import traceback
+import multiprocessing
+import signal
+from contextlib import contextmanager
+from functools import wraps
 
 # Suppress warnings from flask_limiter
 warnings.filterwarnings("ignore", category=UserWarning, module="flask_limiter.extension")
@@ -901,7 +907,8 @@ def process_stt_request():
 
 def web_search(query, api_key=None, num_results=5):
     """
-    Perform a web search using Google Search API with fallback to DuckDuckGo
+    Perform a web search using Google Search API with fallback to DuckDuckGo.
+    Enhanced to provide better results for weather and time-sensitive queries.
     
     Args:
         query (str): Search query
@@ -912,12 +919,25 @@ def web_search(query, api_key=None, num_results=5):
         dict: Search results
     """
     try:
-        # Добавляем текущую дату к запросу для актуальности результатов
+        # Enhance query for better results
         current_date = datetime.datetime.now().strftime("%Y-%m-%d")
-        enhanced_query = f"{query} {current_date}"
-        logger.info(f"Enhanced search query with date: {enhanced_query}")
+        current_hour = datetime.datetime.now().strftime("%H:%M")
         
-        # Try Google Search first
+        # Проверяем, является ли запрос о погоде
+        weather_keywords = ['погода', 'weather', 'temperature', 'forecast', 'температура', 'прогноз']
+        is_weather_query = any(keyword in query.lower() for keyword in weather_keywords)
+        
+        # Улучшаем запрос в зависимости от типа
+        if is_weather_query:
+            # Для запросов о погоде добавляем текущую дату и время
+            enhanced_query = f"{query} {current_date} {current_hour}"
+            logger.info(f"Enhanced weather query with date and time: {enhanced_query}")
+        else:
+            # Для обычных запросов добавляем только дату
+            enhanced_query = f"{query} {current_date}"
+            logger.info(f"Enhanced search query with date: {enhanced_query}")
+        
+        # Try Google Search first if keys are available
         google_api_key = os.environ.get('GOOGLE_API_KEY')
         google_cse_id = os.environ.get('GOOGLE_CSE_ID')
         
@@ -939,12 +959,29 @@ def web_search(query, api_key=None, num_results=5):
             
             formatted_results = []
             for item in results.get('items', []):
+                # Извлекаем дату публикации, если доступна
+                pub_date = ''
+                if 'pagemap' in item and 'metatags' in item['pagemap'] and len(item['pagemap']['metatags']) > 0:
+                    pub_date = item['pagemap']['metatags'][0].get('article:published_time', '')
+                
+                # Добавляем результат
                 formatted_results.append({
                     "title": item.get('title', ''),
                     "url": item.get('link', ''),
                     "snippet": item.get('snippet', ''),
-                    "date": item.get('pagemap', {}).get('metatags', [{}])[0].get('article:published_time', '')
+                    "date": pub_date
                 })
+            
+            # Для запросов о погоде пытаемся получить актуальные данные
+            if is_weather_query and formatted_results:
+                for result in formatted_results:
+                    # Проверяем, содержит ли сниппет числа температуры
+                    if re.search(r'[-+]?\d+°[CF]', result['snippet']) or re.search(r'[-+]?\d+\s*градус', result['snippet'].lower()):
+                        # Помечаем как высокоприоритетный результат погоды
+                        result['is_weather_data'] = True
+                        # Перемещаем в начало списка
+                        formatted_results.remove(result)
+                        formatted_results.insert(0, result)
             
             logger.info(f"Google search returned {len(formatted_results)} results")
             return {
@@ -960,8 +997,11 @@ def web_search(query, api_key=None, num_results=5):
         results = []
         try:
             with DDGS() as ddgs:
-                # Используем timerange='d' для получения результатов за последний день
-                ddgs_results = list(ddgs.text(enhanced_query, max_results=num_results, timerange='d'))
+                # Определяем временной диапазон в зависимости от запроса
+                time_range = 'd' if is_weather_query else 'w'  # d = day, w = week
+                
+                # Используем timerange для получения свежих результатов
+                ddgs_results = list(ddgs.text(enhanced_query, max_results=num_results, timerange=time_range))
                 for r in ddgs_results:
                     results.append({
                         "title": r.get('title', ''),
@@ -969,6 +1009,21 @@ def web_search(query, api_key=None, num_results=5):
                         "snippet": r.get('body', ''),
                         "date": r.get('published', '')
                     })
+                
+                # Если запрос о погоде и результатов мало, пытаемся использовать более специфичный запрос
+                if is_weather_query and len(results) < 2:
+                    specific_weather_query = query + " site:weather.com OR site:accuweather.com OR site:weatherunderground.com"
+                    logger.info(f"Using specific weather query: {specific_weather_query}")
+                    
+                    weather_results = list(ddgs.text(specific_weather_query, max_results=3, timerange='d'))
+                    for r in weather_results:
+                        results.append({
+                            "title": r.get('title', ''),
+                            "url": r.get('href', ''),
+                            "snippet": r.get('body', ''),
+                            "date": r.get('published', ''),
+                            "is_weather_data": True
+                        })
                 
                 # Если недостаточно результатов, добавляем обычный поиск
                 if len(results) < num_results:
@@ -1016,7 +1071,8 @@ def web_search(query, api_key=None, num_results=5):
                 results = []
                 with DDGS() as ddgs:
                     # Используем timerange='d' для свежих результатов
-                    ddgs_results = list(ddgs.text(enhanced_query, max_results=num_results, timerange='d'))
+                    time_range = 'd' if is_weather_query else 'w'
+                    ddgs_results = list(ddgs.text(enhanced_query, max_results=num_results, timerange=time_range))
                     for r in ddgs_results:
                         results.append({
                             "title": r.get('title', ''),
@@ -2188,82 +2244,208 @@ def upload_file_to_1min(file_data, file_name, mime_type, api_key):
         logger.error(f"Error uploading file: {str(e)}")
         raise
 
-def execute_python_code(code, timeout=10):
+class CodeSecurityChecker(ast.NodeVisitor):
     """
-    Execute Python code in a safe environment with timeout
+    Проверяет Python-код на наличие потенциально опасных операций.
+    """
+    
+    def __init__(self):
+        self.has_dangerous_operations = False
+        self.dangerous_operations = []
+    
+    def visit_Import(self, node):
+        dangerous_modules = [
+            'os', 'subprocess', 'sys', 'shutil', 
+            'pathlib', 'pickle', 'marshal', 'socket',
+            'multiprocessing', 're', 'tempfile',
+            'glob', 'ftplib', 'smtplib', 'winreg'
+        ]
+        
+        for name in node.names:
+            if name.name in dangerous_modules:
+                self.has_dangerous_operations = True
+                self.dangerous_operations.append(f"Importing dangerous module: {name.name}")
+        self.generic_visit(node)
+    
+    def visit_ImportFrom(self, node):
+        dangerous_modules = [
+            'os', 'subprocess', 'sys', 'shutil', 
+            'pathlib', 'pickle', 'marshal', 'socket',
+            'multiprocessing', 're', 'tempfile',
+            'glob', 'ftplib', 'smtplib', 'winreg'
+        ]
+        
+        if node.module in dangerous_modules:
+            self.has_dangerous_operations = True
+            self.dangerous_operations.append(f"Importing from dangerous module: {node.module}")
+        self.generic_visit(node)
+    
+    def visit_Call(self, node):
+        dangerous_functions = [
+            'exec', 'eval', 'compile', 'open', 'input', 
+            '__import__', 'getattr', 'setattr', 'delattr'
+        ]
+        
+        # Проверяем вызов функции
+        if isinstance(node.func, ast.Name) and node.func.id in dangerous_functions:
+            self.has_dangerous_operations = True
+            self.dangerous_operations.append(f"Calling dangerous function: {node.func.id}")
+        
+        # Проверяем атрибуты объектов
+        elif isinstance(node.func, ast.Attribute):
+            dangerous_methods = [
+                'system', 'popen', 'spawn', 'call', 'check_output', 
+                'check_call', 'open', 'read', 'write', 'remove', 
+                'rmdir', 'mkdir', 'chdir', 'delete', 'unlink', 
+                'makedirs', 'chmod', 'chown', 'rename', 'loadtxt', 
+                'savetxt', 'load', 'dump', 'loads', 'dumps'
+            ]
+            
+            if node.func.attr in dangerous_methods:
+                self.has_dangerous_operations = True
+                self.dangerous_operations.append(f"Calling dangerous method: {node.func.attr}")
+        
+        self.generic_visit(node)
+
+@contextmanager
+def time_limit(seconds):
+    """
+    Контекстный менеджер для ограничения времени выполнения кода.
     
     Args:
-        code (str): Python code to execute
-        timeout (int): Maximum execution time in seconds
-    
-    Returns:
-        dict: Execution result with stdout, stderr and execution status
+        seconds (int): максимальное время выполнения в секундах
     """
+    def signal_handler(signum, frame):
+        raise TimeoutError("Code execution timed out")
+    
+    previous_handler = signal.signal(signal.SIGALRM, signal_handler)
+    signal.alarm(seconds)
+    
     try:
-        logger.info(f"Executing Python code: {code[:100]}{'...' if len(code) > 100 else ''}")
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+def execute_python_code(code):
+    """
+    Безопасно выполняет Python-код с ограничением времени и проверками безопасности.
+    
+    Args:
+        code (str): Python-код для выполнения
         
-        # Create a temporary file to execute the code
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as temp_file:
-            temp_file_path = temp_file.name
-            temp_file.write(code)
+    Returns:
+        dict: результат выполнения кода (результат, статус, ошибка если есть)
+    """
+    # Проверка безопасности кода
+    try:
+        parsed_ast = ast.parse(code)
+        security_checker = CodeSecurityChecker()
+        security_checker.visit(parsed_ast)
         
-        try:
-            # Use subprocess to execute the code with timeout
-            process = subprocess.Popen(
-                [sys.executable, temp_file_path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            
-            try:
-                stdout, stderr = process.communicate(timeout=timeout)
-                return_code = process.returncode
-                
-                result = {
-                    "status": "success" if return_code == 0 else "error",
-                    "stdout": stdout,
-                    "stderr": stderr,
-                    "return_code": return_code
-                }
-                
-                logger.info(f"Python code executed with return code {return_code}: {stdout[:100]}{'...' if len(stdout) > 100 else ''}")
-                return result
-                
-            except subprocess.TimeoutExpired:
-                process.kill()
-                stdout, stderr = process.communicate()
-                
-                logger.warning(f"Python code execution timed out after {timeout} seconds")
-                return {
-                    "status": "timeout",
-                    "stdout": stdout,
-                    "stderr": f"Execution timed out after {timeout} seconds",
-                    "return_code": -1
-                }
-                
-        except Exception as e:
-            logger.error(f"Error executing Python code: {str(e)}")
+        if security_checker.has_dangerous_operations:
+            logger.warning(f"Потенциально опасный код обнаружен: {security_checker.dangerous_operations}")
             return {
+                "result": None,
                 "status": "error",
-                "stdout": "",
-                "stderr": str(e),
-                "return_code": -1
+                "error": f"Код содержит потенциально опасные операции: {', '.join(security_checker.dangerous_operations)}"
             }
+    except SyntaxError as e:
+        logger.error(f"Синтаксическая ошибка в коде: {str(e)}")
+        return {
+            "result": None,
+            "status": "error",
+            "error": f"Синтаксическая ошибка: {str(e)}"
+        }
+    
+    # Подготовка для перехвата stdout/stderr
+    stdout_capture = io.StringIO()
+    stderr_capture = io.StringIO()
+    
+    # Создаем временное окружение для выполнения
+    execution_environment = {'__builtins__': __builtins__}
+    
+    # Функция выполнения в отдельном процессе
+    def execute_in_subprocess(code, result_queue):
+        try:
+            # Перенаправляем вывод
+            sys.stdout = stdout_capture
+            sys.stderr = stderr_capture
+            
+            # Выполняем код
+            exec(code, execution_environment)
+            
+            # Получаем результаты
+            stdout_output = stdout_capture.getvalue()
+            stderr_output = stderr_capture.getvalue()
+            
+            # Помещаем результаты в очередь
+            result_queue.put({
+                "result": stdout_output,
+                "error": stderr_output if stderr_output else None,
+                "status": "success" if not stderr_output else "warning"
+            })
+        except Exception as e:
+            error_message = f"{type(e).__name__}: {str(e)}"
+            traceback_str = traceback.format_exc()
+            result_queue.put({
+                "result": stdout_capture.getvalue(),
+                "error": error_message,
+                "traceback": traceback_str,
+                "status": "error"
+            })
         finally:
-            # Clean up the temporary file
-            try:
-                os.unlink(temp_file_path)
-            except:
-                pass
+            # Восстанавливаем стандартные выводы
+            sys.stdout = sys.__stdout__
+            sys.stderr = sys.__stderr__
+    
+    # Запускаем выполнение с ограничением времени
+    try:
+        # Создаем очередь для получения результатов
+        result_queue = multiprocessing.Queue()
+        
+        # Создаем и запускаем процесс
+        process = multiprocessing.Process(
+            target=execute_in_subprocess,
+            args=(code, result_queue)
+        )
+        
+        # Запускаем процесс с ограничением времени
+        process.start()
+        
+        # Ждем выполнения в течение 10 секунд
+        process.join(10)
+        
+        # Проверяем, завершился ли процесс
+        if process.is_alive():
+            # Если процесс все еще работает, завершаем его
+            process.terminate()
+            process.join()
+            
+            logger.warning("Код выполнялся слишком долго и был прерван")
+            return {
+                "result": stdout_capture.getvalue(),
+                "status": "error",
+                "error": "Превышено время выполнения (10 секунд)"
+            }
+        
+        # Получаем результат выполнения
+        if not result_queue.empty():
+            result = result_queue.get()
+            return result
+        else:
+            return {
+                "result": None,
+                "status": "error",
+                "error": "Не удалось получить результат выполнения"
+            }
             
     except Exception as e:
-        logger.error(f"Error setting up Python code execution: {str(e)}")
+        logger.error(f"Ошибка при выполнении кода: {str(e)}")
         return {
+            "result": None,
             "status": "error",
-            "stdout": "",
-            "stderr": str(e),
-            "return_code": -1
+            "error": f"Ошибка выполнения: {str(e)}"
         }
 
 def create_conversation_with_files(api_key, title, model, file_ids):
@@ -2303,6 +2485,67 @@ def create_conversation_with_files(api_key, title, model, file_ids):
     except Exception as e:
         logger.error(f"Error creating conversation: {str(e)}")
         raise
+
+@app.route('/', methods=['POST'])
+def relay():
+    """
+    Main handler for API requests
+    """
+    start_time = datetime.datetime.now()
+    response_data = {
+        "status": "error",
+        "message": "Unknown error occurred",
+        "data": None,
+        "processing_time": None
+    }
+    
+    try:
+        data = request.get_json()
+        if not data:
+            response_data["message"] = "No data provided"
+            return jsonify(response_data)
+        
+        query = data.get("query", "")
+        api_key = data.get("api_key", "")
+        model = data.get("model", DEFAULT_MODEL)
+        language = data.get("language", "en")
+        tool = data.get("tool", "")
+        
+        if not query and not tool:
+            response_data["message"] = "No query or tool specified"
+            return jsonify(response_data)
+        
+        # Определяем, какой инструмент использовать
+        if tool == "web_search":
+            result = web_search(query, api_key)
+            response_data["status"] = "success"
+            response_data["data"] = result
+            response_data["message"] = "Web search completed successfully"
+        elif tool == "execute_python":
+            code = data.get("code", "")
+            if not code:
+                response_data["message"] = "No code provided for execution"
+                return jsonify(response_data)
+            
+            result = execute_python_code(code)
+            response_data["status"] = "success"
+            response_data["data"] = result
+            response_data["message"] = "Python code executed successfully"
+        else:
+            response_data["message"] = f"Unknown tool: {tool}"
+            
+    except Exception as e:
+        logger.error(f"Error in relay: {str(e)}")
+        response_data["message"] = f"Error: {str(e)}"
+        
+    finally:
+        end_time = datetime.datetime.now()
+        processing_time = (end_time - start_time).total_seconds()
+        response_data["processing_time"] = processing_time
+        logger.info(f"Request processed in {processing_time:.2f} seconds")
+        
+        response = jsonify(response_data)
+        return set_response_headers(response)
 
 # The main function to start the server
 if __name__ == "__main__":
