@@ -971,6 +971,12 @@ def process_stt_request():
             use_web_search = True
             logger.debug(f"Enabling web search for model {original_model}")
         
+        # Проверяем, не используется ли whisper-1 в качестве модели для ответа
+        if original_model == "whisper-1":
+            # Заменяем на модель по умолчанию, так как whisper-1 не может генерировать ответы
+            logger.warning("Whisper-1 не может использоваться для генерации ответов. Используем gpt-4o-mini вместо этого.")
+            original_model = "gpt-4o-mini"
+        
         # Prepare 1minAI API request
         payload = {
             "type": "CHAT_WITH_AI",
@@ -1005,68 +1011,129 @@ def process_stt_request():
             
             try:
                 # Send the request to 1minAI API
-                with requests.post(api_url, json=payload, headers=headers, stream=streaming) as response:
-                    response.raise_for_status()
+                try:
+                    with requests.post(api_url, json=payload, headers=headers, stream=streaming) as response:
+                        response.raise_for_status()
+                        
+                        # Process the response based on streaming or not
+                        if streaming:
+                            # Process streaming response
+                            prompt_tokens = len(transcription.split())
+                            total_completion_tokens = 0
+                            
+                            # Yield the initial chunk
+                            initial_response = transform_streaming_chunk({}, messages, original_model)
+                            yield f"data: {json.dumps(initial_response)}\n\n"
+                            
+                            # Process each chunk in the streaming response
+                            for line in response.iter_lines():
+                                if line:
+                                    try:
+                                        # Try to parse the line as JSON
+                                        data = json.loads(line.decode('utf-8'))
+                                        transformed_chunk = transform_streaming_chunk(data, messages, original_model)
+                                        yield f"data: {json.dumps(transformed_chunk)}\n\n"
+                                        
+                                        # Count tokens for debugging
+                                        if 'content' in data:
+                                            total_completion_tokens += len(data['content'].split())
+                                    except Exception as e:
+                                        logger.error(f"Error processing streaming chunk: {str(e)}")
+                                        # Send error info to client
+                                        error_chunk = {
+                                            "id": f"chatcmpl-{uuid.uuid4()}",
+                                            "object": "chat.completion.chunk",
+                                            "created": int(time.time()),
+                                            "model": original_model,
+                                            "choices": [
+                                                {
+                                                    "index": 0,
+                                                    "delta": {"content": f"\nError: {str(e)}"},
+                                                    "finish_reason": "error"
+                                                }
+                                            ]
+                                        }
+                                        yield f"data: {json.dumps(error_chunk)}\n\n"
+                            
+                            # Send the final [DONE] marker
+                            yield "data: [DONE]\n\n"
+                            
+                            # Log completion for debugging
+                            logger.debug(f"Finished processing streaming response. Completion tokens: {total_completion_tokens}")
+                            logger.debug(f"Total tokens: {prompt_tokens + total_completion_tokens}")
+                        else:
+                            # Process non-streaming response
+                            response_data = response.json()
+                            prompt_tokens = len(transcription.split())
+                            
+                            # Transform response
+                            transformed_response = transform_response(response_data, {"messages": messages}, prompt_tokens)
+                            
+                            # Return response in streaming format for consistency
+                            yield f"data: {json.dumps(transformed_response)}\n\n"
+                            yield "data: [DONE]\n\n"
+                except requests.exceptions.HTTPError as e:
+                    logger.error(f"HTTP error in conversation request: {str(e)}")
+                    # Если возникла ошибка 500, попробуем отправить запрос без стриминга
+                    if e.response.status_code == 500 and streaming:
+                        logger.warning("Ошибка 500 при потоковом запросе, пробуем без потокового режима")
+                        try:
+                            # Изменяем URL на не-стриминговый
+                            non_streaming_url = ONE_MIN_API_URL
+                            response = requests.post(non_streaming_url, json=payload, headers=headers)
+                            response.raise_for_status()
+                            
+                            # Обрабатываем обычный ответ
+                            response_data = response.json()
+                            prompt_tokens = len(transcription.split())
+                            
+                            # Преобразуем ответ в формат OpenAI
+                            transformed_response = transform_response(response_data, {"messages": messages}, prompt_tokens)
+                            
+                            # Возвращаем ответ в формате потока для согласованности
+                            yield f"data: {json.dumps(transformed_response)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+                        except Exception as retry_e:
+                            logger.error(f"Повторная попытка без стриминга тоже не удалась: {str(retry_e)}")
                     
-                    # Process the response based on streaming or not
-                    if streaming:
-                        # Process streaming response
-                        prompt_tokens = len(transcription.split())
-                        total_completion_tokens = 0
-                        
-                        # Yield the initial chunk
-                        initial_response = transform_streaming_chunk({}, messages, original_model)
-                        yield f"data: {json.dumps(initial_response)}\n\n"
-                        
-                        # Process each chunk in the streaming response
-                        for line in response.iter_lines():
-                            if line:
-                                try:
-                                    # Try to parse the line as JSON
-                                    data = json.loads(line.decode('utf-8'))
-                                    transformed_chunk = transform_streaming_chunk(data, messages, original_model)
-                                    yield f"data: {json.dumps(transformed_chunk)}\n\n"
-                                    
-                                    # Count tokens for debugging
-                                    if 'content' in data:
-                                        total_completion_tokens += len(data['content'].split())
-                                except Exception as e:
-                                    logger.error(f"Error processing streaming chunk: {str(e)}")
-                                    # Send error info to client
-                                    error_chunk = {
-                                        "id": f"chatcmpl-{uuid.uuid4()}",
-                                        "object": "chat.completion.chunk",
-                                        "created": int(time.time()),
-                                        "model": original_model,
-                                        "choices": [
-                                            {
-                                                "index": 0,
-                                                "delta": {"content": f"\nError: {str(e)}"},
-                                                "finish_reason": "error"
-                                            }
-                                        ]
-                                    }
-                                    yield f"data: {json.dumps(error_chunk)}\n\n"
-                        
-                        # Send the final [DONE] marker
-                        yield "data: [DONE]\n\n"
-                        
-                        # Log completion for debugging
-                        logger.debug(f"Finished processing streaming response. Completion tokens: {total_completion_tokens}")
-                        logger.debug(f"Total tokens: {prompt_tokens + total_completion_tokens}")
-                    else:
-                        # Process non-streaming response
-                        response_data = response.json()
-                        prompt_tokens = len(transcription.split())
-                        
-                        # Transform response
-                        transformed_response = transform_response(response_data, {"messages": messages}, prompt_tokens)
-                        
-                        # Return response in streaming format for consistency
-                        yield f"data: {json.dumps(transformed_response)}\n\n"
-                        yield "data: [DONE]\n\n"
-            except requests.exceptions.HTTPError as e:
-                logger.error(f"HTTP error in conversation request: {str(e)}")
+                    # Возвращаем информацию об ошибке клиенту
+                    error_response = {
+                        "id": f"chatcmpl-{uuid.uuid4()}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": original_model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": f"\nОшибка связи с сервисом AI: {str(e)}"},
+                                "finish_reason": "error"
+                            }
+                        ]
+                    }
+                    yield f"data: {json.dumps(error_response)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    
+                except requests.exceptions.RequestException as e:
+                    logger.error(f"Request error in conversation request: {str(e)}")
+                    error_response = {
+                        "id": f"chatcmpl-{uuid.uuid4()}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": original_model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": f"\nОшибка запроса: {str(e)}"},
+                                "finish_reason": "error"
+                            }
+                        ]
+                    }
+                    yield f"data: {json.dumps(error_response)}\n\n"
+                    yield "data: [DONE]\n\n"
+            except Exception as e:
+                logger.error(f"General error in generate function: {str(e)}")
+                logger.error(traceback.format_exc())
                 error_response = {
                     "id": f"chatcmpl-{uuid.uuid4()}",
                     "object": "chat.completion.chunk",
@@ -1075,7 +1142,7 @@ def process_stt_request():
                     "choices": [
                         {
                             "index": 0,
-                            "delta": {"content": f"\nError communicating with AI service: {str(e)}"},
+                            "delta": {"content": f"\nНеизвестная ошибка: {str(e)}"},
                             "finish_reason": "error"
                         }
                     ]
@@ -1203,7 +1270,12 @@ def audio_transcriptions():
     if request.method == 'OPTIONS':
         return handle_options_request()
     
-    return process_stt_request()
+    try:
+        return process_stt_request()
+    except Exception as e:
+        logger.error(f"Error in audio_transcriptions endpoint: {str(e)}")
+        logger.error(traceback.format_exc())
+        return ERROR_HANDLER(1500, detail=f"Error processing audio: {str(e)}")
 
 @app.route('/v1/audio/speech', methods=['POST', 'OPTIONS'])
 @limiter.limit("500 per minute")
@@ -1474,6 +1546,34 @@ def conversation():
             
         except Exception as e:
             return ERROR_HANDLER(1500, detail=str(e))
+
+def transform_streaming_chunk(data, messages, model):
+    """Transform a streaming chunk from 1minAI to OpenAI format"""
+    # Generate a consistent ID for the completion
+    completion_id = f"chatcmpl-{uuid.uuid4()}"
+    
+    # Create the initial response structure
+    response = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": map_model_to_openai(model),
+        "choices": [
+            {
+                "index": 0,
+                "delta": {
+                    "role": "assistant"
+                } if not data else {"content": data.get('content', '')} if 'content' in data else {},
+                "finish_reason": None
+            }
+        ]
+    }
+    
+    # If this is an end of stream marker
+    if data and data.get('stop', False):
+        response["choices"][0]["finish_reason"] = "stop"
+    
+    return response
 
 def transform_streaming_response(data, request_data, last_output, prompt_tokens):
     """Transform 1minAI streaming response format to OpenAI streaming format"""
