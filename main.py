@@ -30,6 +30,7 @@ import io
 import sys
 from itertools import islice
 import hashlib
+from flask_cors import CORS
 
 # Suppress warnings from flask_limiter
 warnings.filterwarnings("ignore", category=UserWarning, module="flask_limiter.extension")
@@ -99,6 +100,10 @@ def calculate_token(sentence, model="DEFAULT"):
 
 # Initialize Flask app
 app = Flask(__name__)
+
+# Включаем CORS для всех доменов
+CORS(app)
+
 if check_memcached_connection():
     limiter = Limiter(
         get_remote_address,
@@ -266,11 +271,19 @@ def ERROR_HANDLER(code, model=None, key=None, detail=None):
     logger.error(f"An error has occurred while processing the user's request. Error code: {code}")
     return jsonify({"error": error_data}), error_codes.get(code, {}).get("http_code", 400) # Return the error data without http_code inside the payload and get the http_code to return.
 
-def handle_options_request():
-    response = make_response()
+def set_response_headers(response):
+    """Set CORS and other headers for the response"""
     response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+    response.headers.add('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+    response.headers.add('Access-Control-Allow-Credentials', 'true')
+    response.headers.add('Access-Control-Max-Age', '3600')
+    return response
+
+def handle_options_request():
+    """Handle OPTIONS request for CORS preflight"""
+    response = make_response()
+    set_response_headers(response)
     return response, 204
 
 def extract_api_key():
@@ -279,12 +292,6 @@ def extract_api_key():
     if not auth_header or not auth_header.startswith("Bearer "):
         return None
     return auth_header.split(" ")[1]
-
-def set_response_headers(response):
-    """Set common response headers"""
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-    return response
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
@@ -490,10 +497,12 @@ def process_tools(tools, tool_choice, model):
     Returns:
         dict: 1minAI compatible tools configuration
     """
-    if not tools:
-        # Add default tools for supported models
-        if model in tools_supported_models:
-            # Default tools for all supported models
+    # Всегда пытаемся обработать инструменты, даже если модель не в списке поддерживаемых
+    try:
+        if tools:
+            logger.info(f"Processing {len(tools)} tools for model {model}")
+            
+            # Default tools for all models - добавляем только если нет инструментов
             default_tools = [
                 {
                     "name": "get_current_datetime",
@@ -551,30 +560,42 @@ def process_tools(tools, tool_choice, model):
                 }
             ]
             
-            # Combine with any user-provided tools
-            tools = tools + default_tools if tools else default_tools
+            # Объединяем пользовательские инструменты со стандартными, только если нет пользовательских
+            combined_tools = tools if tools else default_tools
         else:
-            # If the model does not support tools, just return None
-            logger.warning(f"Model {model} does not support tool use, ignoring tools parameter")
-            return None
-    elif model not in tools_supported_models:
-        # If the model does not support tools, just return None
-        logger.warning(f"Model {model} does not support tool use, ignoring tools parameter")
+            # Если модель не поддерживает tools и инструменты не предоставлены, возвращаем None
+            if model not in tools_supported_models:
+                logger.warning(f"Model {model} does not officially support tool use, and no tools were provided")
+                return None
+                
+            # Для поддерживаемых моделей используем стандартные инструменты
+            combined_tools = default_tools
+            logger.info(f"Using default tools for model {model}")
+    except Exception as e:
+        logger.error(f"Error preparing tools: {str(e)}")
         return None
     
     # Convert OpenAI tools format to 1minAI format
     one_min_tools = []
     
-    for tool in tools:
-        # Currently only 'function' type is supported
-        if tool.get('type', 'function') == 'function':
-            function_def = tool.get('function', tool)  # Handle both formats
-            one_min_tool = {
-                "name": function_def.get('name', ''),
-                "description": function_def.get('description', ''),
-                "parameters": function_def.get('parameters', {})
-            }
-            one_min_tools.append(one_min_tool)
+    for tool in combined_tools:
+        try:
+            # Currently only 'function' type is supported
+            if tool.get('type', 'function') == 'function':
+                function_def = tool.get('function', tool)  # Handle both formats
+                one_min_tool = {
+                    "name": function_def.get('name', ''),
+                    "description": function_def.get('description', ''),
+                    "parameters": function_def.get('parameters', {})
+                }
+                one_min_tools.append(one_min_tool)
+            elif 'name' in tool and 'description' in tool and 'parameters' in tool:
+                # Обрабатываем old-style функции напрямую
+                one_min_tools.append(tool)
+        except Exception as e:
+            logger.warning(f"Error processing tool {tool}: {str(e)}")
+            # Пропускаем проблемный инструмент и продолжаем с остальными
+            continue
     
     # Process tool_choice
     auto_invoke = True  # Default
@@ -585,7 +606,13 @@ def process_tools(tools, tool_choice, model):
         # 1minAI doesn't directly support this, but we can add this to the prompt
         pass
     
-    # ВАЖНО: Не включаем ссылки на функции в возвращаемый объект
+    # Проверяем, что у нас есть инструменты после обработки
+    if not one_min_tools:
+        logger.warning("No valid tools after processing")
+        return None
+        
+    logger.info(f"Successfully processed {len(one_min_tools)} tools")
+    
     return {
         "tools": one_min_tools,
         "autoInvoke": auto_invoke
@@ -678,9 +705,29 @@ def handle_execute_python(params):
         if not code:
             return {"error": "No code provided"}
         
+        # Расширенное логирование
+        logger.info(f"Executing Python code with timeout {timeout}s: {code[:100]}...")
+        
         # Execute the code
         result = execute_python_code(code, timeout)
-        return result
+        
+        # Детальное логирование результата
+        log_prefix = "Success" if result["status"] == "success" else "Failed"
+        logger.info(f"{log_prefix} Python execution. Return code: {result['return_code']}")
+        
+        if result["stderr"]:
+            logger.warning(f"Python execution stderr: {result['stderr'][:200]}...")
+        
+        # Добавим больше информации в ответ
+        response = {
+            "status": result["status"],
+            "output": result["stdout"],
+            "error": result["stderr"] if result["stderr"] else None,
+            "return_code": result["return_code"],
+            "execution_time": f"{timeout}s (timeout)" if result["status"] == "timeout" else None
+        }
+        
+        return response
     except Exception as e:
         logger.error(f"Error handling execute_python tool: {str(e)}")
         return {"error": str(e)}
@@ -865,19 +912,25 @@ def web_search(query, api_key=None, num_results=5):
         dict: Search results
     """
     try:
+        # Добавляем текущую дату к запросу для актуальности результатов
+        current_date = datetime.datetime.now().strftime("%Y-%m-%d")
+        enhanced_query = f"{query} {current_date}"
+        logger.info(f"Enhanced search query with date: {enhanced_query}")
+        
         # Try Google Search first
         google_api_key = os.environ.get('GOOGLE_API_KEY')
         google_cse_id = os.environ.get('GOOGLE_CSE_ID')
         
         if google_api_key and google_cse_id:
-            logger.info(f"Performing Google search for: {query}")
+            logger.info(f"Performing Google search for: {enhanced_query}")
             
             url = "https://www.googleapis.com/customsearch/v1"
             params = {
-                'q': query,
+                'q': enhanced_query,
                 'key': google_api_key,
                 'cx': google_cse_id,
-                'num': min(num_results, 10)  # Google limits to 10 results
+                'num': min(num_results, 10),  # Google limits to 10 results
+                'sort': 'date'  # Сортировка по дате для получения свежих результатов
             }
             
             response = requests.get(url, params=params)
@@ -890,13 +943,14 @@ def web_search(query, api_key=None, num_results=5):
                     "title": item.get('title', ''),
                     "url": item.get('link', ''),
                     "snippet": item.get('snippet', ''),
-                    "date": ''  # Google API doesn't provide dates
+                    "date": item.get('pagemap', {}).get('metatags', [{}])[0].get('article:published_time', '')
                 })
             
             logger.info(f"Google search returned {len(formatted_results)} results")
             return {
                 "results": formatted_results,
-                "query": query
+                "query": query,
+                "enhanced_query": enhanced_query
             }
         
         # Fallback to DuckDuckGo if Google Search is not configured
@@ -906,7 +960,8 @@ def web_search(query, api_key=None, num_results=5):
         results = []
         try:
             with DDGS() as ddgs:
-                ddgs_results = list(ddgs.text(query, max_results=num_results))
+                # Используем timerange='d' для получения результатов за последний день
+                ddgs_results = list(ddgs.text(enhanced_query, max_results=num_results, timerange='d'))
                 for r in ddgs_results:
                     results.append({
                         "title": r.get('title', ''),
@@ -914,13 +969,40 @@ def web_search(query, api_key=None, num_results=5):
                         "snippet": r.get('body', ''),
                         "date": r.get('published', '')
                     })
+                
+                # Если недостаточно результатов, добавляем обычный поиск
+                if len(results) < num_results:
+                    logger.info(f"Not enough recent results, adding general results for: {enhanced_query}")
+                    general_results = list(ddgs.text(enhanced_query, max_results=num_results - len(results)))
+                    for r in general_results:
+                        results.append({
+                            "title": r.get('title', ''),
+                            "url": r.get('href', ''),
+                            "snippet": r.get('body', ''),
+                            "date": r.get('published', '')
+                        })
         except Exception as ddg_err:
             logger.error(f"DuckDuckGo search error: {str(ddg_err)}")
+            # Альтернативный вариант - использовать регулярный DuckDuckGo поиск
+            try:
+                logger.info(f"Trying alternative DuckDuckGo search for: {enhanced_query}")
+                with DDGS() as ddgs:
+                    ddgs_results = list(ddgs.text(enhanced_query, max_results=num_results))
+                    for r in ddgs_results:
+                        results.append({
+                            "title": r.get('title', ''),
+                            "url": r.get('href', ''),
+                            "snippet": r.get('body', ''),
+                            "date": r.get('published', '')
+                        })
+            except Exception as alt_err:
+                logger.error(f"Alternative DuckDuckGo search also failed: {str(alt_err)}")
         
         logger.info(f"DuckDuckGo search returned {len(results)} results")
         return {
             "results": results,
-            "query": query
+            "query": query,
+            "enhanced_query": enhanced_query
         }
         
     except Exception as e:
@@ -933,7 +1015,8 @@ def web_search(query, api_key=None, num_results=5):
                 
                 results = []
                 with DDGS() as ddgs:
-                    ddgs_results = list(ddgs.text(query, max_results=num_results))
+                    # Используем timerange='d' для свежих результатов
+                    ddgs_results = list(ddgs.text(enhanced_query, max_results=num_results, timerange='d'))
                     for r in ddgs_results:
                         results.append({
                             "title": r.get('title', ''),
@@ -945,7 +1028,8 @@ def web_search(query, api_key=None, num_results=5):
                 logger.info(f"DuckDuckGo fallback search returned {len(results)} results")
                 return {
                     "results": results,
-                    "query": query
+                    "query": query,
+                    "enhanced_query": enhanced_query
                 }
             except Exception as ddg_e:
                 logger.error(f"DuckDuckGo fallback search error: {str(ddg_e)}")
@@ -1056,41 +1140,61 @@ def conversation():
         # Определяем базовый набор инструментов
         base_tools = request_data.get('tools', [])
         
+        # Список функций, которые будем добавлять
+        standard_tool_functions = {
+            "get_datetime": {"name": "get_datetime", "description": "Get current date and time"},
+            "execute_python": {"name": "execute_python", "description": "Execute Python code"},
+            "web_search": {"name": "web_search", "description": "Search the web"}
+        }
+        
         # Для поддерживаемых моделей автоматически добавляем стандартные инструменты
         if model in tools_supported_models:
-            # Добавляем стандартные инструменты, если они не указаны явно
+            # Преобразуем в стандартный формат OpenAI для tools
             standard_tools = [
-                {"type": "function", "function": {"name": "get_datetime", "description": "Get current date and time"}},
-                {"type": "function", "function": {"name": "execute_python", "description": "Execute Python code"}},
-                {"type": "function", "function": {"name": "web_search", "description": "Search the web"}}
+                {"type": "function", "function": func_def} 
+                for func_name, func_def in standard_tool_functions.items()
             ]
             
             # Если инструменты не заданы, используем стандартные
             if not base_tools:
                 base_tools = standard_tools
+                logger.info(f"No tools provided, adding standard tools for model {model}")
             # Иначе добавляем стандартные, если их еще нет
             else:
-                existing_tool_names = [t.get('function', {}).get('name', '') for t in base_tools if t.get('type') == 'function']
-                for std_tool in standard_tools:
-                    if std_tool['function']['name'] not in existing_tool_names:
-                        base_tools.append(std_tool)
+                existing_tool_names = set()
+                
+                for tool in base_tools:
+                    if tool.get('type') == 'function':
+                        func_name = tool.get('function', {}).get('name', '')
+                        if func_name:
+                            existing_tool_names.add(func_name)
+                    elif 'name' in tool:  # Обрабатываем и old-style функции
+                        existing_tool_names.add(tool['name'])
+                
+                # Добавляем недостающие стандартные инструменты
+                for func_name, func_def in standard_tool_functions.items():
+                    if func_name not in existing_tool_names:
+                        base_tools.append({"type": "function", "function": func_def})
+                        logger.info(f"Adding standard tool {func_name} to request for model {model}")
             
+            # Обрабатываем инструменты
             tools_config = process_tools(
                 base_tools,
                 request_data.get('tool_choice', 'auto'),
                 model
             )
-            logger.info(f"Added tools configuration for supported model {model}: {[t.get('function', {}).get('name', '') for t in base_tools if t.get('type') == 'function']}")
+            logger.info(f"Added tools configuration for model {model}: {', '.join([t.get('function', {}).get('name', t.get('name', '')) for t in base_tools if t.get('type') == 'function' or 'name' in t])}")
         else:
             # Для неподдерживаемых моделей пробуем обработать только явно указанные инструменты
             if base_tools:
                 try:
+                    # Попытка добавить инструменты даже для неподдерживаемых моделей
                     tools_config = process_tools(
                         base_tools,
                         request_data.get('tool_choice', 'auto'),
                         model
                     )
-                    logger.warning(f"Processing tools for potentially unsupported model {model}")
+                    logger.warning(f"Processing tools for potentially unsupported model {model} - attempting anyway")
                 except Exception as tool_e:
                     logger.warning(f"Failed to process tools for model {model}: {str(tool_e)}")
                     # Продолжаем без инструментов
@@ -2098,81 +2202,63 @@ def execute_python_code(code, timeout=10):
     try:
         logger.info(f"Executing Python code: {code[:100]}{'...' if len(code) > 100 else ''}")
         
-        # Create a string buffer to capture output
-        output = io.StringIO()
-        error = io.StringIO()
+        # Create a temporary file to execute the code
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as temp_file:
+            temp_file_path = temp_file.name
+            temp_file.write(code)
         
-        # Redirect stdout and stderr
-        sys.stdout = output
-        sys.stderr = error
-        
-        # Create safe globals
-        safe_globals = {
-            '__builtins__': {
-                name: getattr(__builtins__, name)
-                for name in ['abs', 'all', 'any', 'ascii', 'bin', 'bool', 'bytearray', 'bytes',
-                             'chr', 'complex', 'dict', 'dir', 'divmod', 'enumerate', 'filter',
-                             'float', 'format', 'frozenset', 'hash', 'hex', 'int', 'isinstance',
-                             'issubclass', 'iter', 'len', 'list', 'map', 'max', 'min', 'next',
-                             'object', 'oct', 'ord', 'pow', 'print', 'range', 'repr', 'reversed',
-                             'round', 'set', 'slice', 'sorted', 'str', 'sum', 'tuple', 'type',
-                             'zip']
-            }
-        }
-        
-        # Add some safe modules
-        for module_name in ['math', 'random', 'datetime', 're', 'json', 'collections']:
-            try:
-                safe_globals[module_name] = __import__(module_name)
-            except ImportError:
-                pass
-        
-        # Execute the code
         try:
-            # Create a thread to execute the code with timeout
-            def exec_code():
-                exec(code, safe_globals, {})
+            # Use subprocess to execute the code with timeout
+            process = subprocess.Popen(
+                [sys.executable, temp_file_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
             
-            import threading
-            thread = threading.Thread(target=exec_code)
-            thread.daemon = True
-            
-            thread.start()
-            thread.join(timeout)
-            
-            if thread.is_alive():
-                # Timeout occurred
+            try:
+                stdout, stderr = process.communicate(timeout=timeout)
+                return_code = process.returncode
+                
+                result = {
+                    "status": "success" if return_code == 0 else "error",
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "return_code": return_code
+                }
+                
+                logger.info(f"Python code executed with return code {return_code}: {stdout[:100]}{'...' if len(stdout) > 100 else ''}")
+                return result
+                
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate()
+                
                 logger.warning(f"Python code execution timed out after {timeout} seconds")
                 return {
                     "status": "timeout",
-                    "stdout": output.getvalue(),
+                    "stdout": stdout,
                     "stderr": f"Execution timed out after {timeout} seconds",
                     "return_code": -1
                 }
-            
-            result = {
-                "status": "success",
-                "stdout": output.getvalue(),
-                "stderr": error.getvalue(),
-                "return_code": 0
-            }
-            logger.info(f"Python code executed successfully: {result['stdout'][:100]}{'...' if len(result['stdout']) > 100 else ''}")
+                
         except Exception as e:
-            result = {
+            logger.error(f"Error executing Python code: {str(e)}")
+            return {
                 "status": "error",
-                "stdout": output.getvalue(),
+                "stdout": "",
                 "stderr": str(e),
                 "return_code": -1
             }
-        
-        # Restore stdout and stderr
-        sys.stdout = sys.__stdout__
-        sys.stderr = sys.__stderr__
-        
-        return result
-        
+        finally:
+            # Clean up the temporary file
+            try:
+                os.unlink(temp_file_path)
+            except:
+                pass
+            
     except Exception as e:
-        logger.error(f"Error executing Python code: {str(e)}")
+        logger.error(f"Error setting up Python code execution: {str(e)}")
         return {
             "status": "error",
             "stdout": "",
