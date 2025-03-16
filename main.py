@@ -801,10 +801,10 @@ def process_tts_request(request_data):
 
 def process_stt_request():
     """
-    Process speech-to-text request and forward the transcribed text to the original model
+    Process speech-to-text request
     
     Returns:
-        Response: Flask response with AI completion or error
+        Response: Flask response with transcription or error
     """
     logger.info("Processing speech-to-text request")
     
@@ -876,24 +876,44 @@ def process_stt_request():
         # Log response details
         logger.debug(f"Speech-to-text response status: {response.status_code}")
         logger.debug(f"Speech-to-text response headers: {response.headers}")
-        try:
-            response_json = response.json()
-            logger.debug(f"Speech-to-text response body: {json.dumps(response_json)[:200]}...")
-        except:
-            logger.debug(f"Speech-to-text response body (not JSON): {response.text[:200]}...")
+        logger.debug(f"Speech-to-text response body: {response.text[:1000]}...")
         
         response.raise_for_status()
+        response_data = response.json()
         
-        # Get transcription text from response
-        transcription = response.text  # For format "text"
-        try:
-            # Try to parse JSON response if that's what we got
-            response_data = response.json()
-            if isinstance(response_data, dict) and 'text' in response_data:
-                transcription = response_data['text']
-        except:
-            pass
+        # Извлекаем текст из ответа - ищем его в разных местах JSON
+        transcription = ""
+        
+        # Проверяем разные пути, где может быть текст
+        if "aiRecord" in response_data and "aiRecordDetail" in response_data["aiRecord"]:
+            details = response_data["aiRecord"]["aiRecordDetail"]
             
+            # Ищем в известных полях
+            for field in ["text", "transcript", "result"]:
+                if field in details and details[field]:
+                    transcription = details[field]
+                    break
+            
+            # Если не нашли, ищем в promptObject
+            if not transcription and "promptObject" in details:
+                for field in ["text", "transcript", "result"]:
+                    if field in details["promptObject"] and details["promptObject"][field]:
+                        transcription = details["promptObject"][field]
+                        break
+        
+        # Если все еще не нашли, ищем в корне ответа
+        if not transcription:
+            for field in ["text", "transcript", "result"]:
+                if field in response_data and response_data[field]:
+                    transcription = response_data[field]
+                    break
+        
+        # Если не нашли текст нигде, используем дефолтное сообщение
+        if not transcription:
+            logger.warning(f"Cannot extract transcription from response: {json.dumps(response_data)[:500]}")
+            transcription = "Не удалось распознать текст в аудио"
+            return jsonify({"text": transcription})
+        
         logger.info(f"Transcription successful: {transcription[:50]}...")
         
         # Now that we have the transcription, send it to the original model
@@ -916,19 +936,6 @@ def process_stt_request():
         temperature = float(request.form.get('temperature', 0.7))
         max_tokens = int(request.form.get('max_tokens', 1024))
         top_p = float(request.form.get('top_p', 1.0))
-        
-        # Create a simulated request to conversation endpoint
-        conversation_payload = {
-            "model": original_model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "top_p": top_p,
-            "stream": True  # Stream the response back
-        }
-        
-        # Process the conversation request
-        logger.info(f"Processing transcribed text with model {original_model}")
         
         # Extract model capabilities
         use_web_search = False
@@ -968,67 +975,85 @@ def process_stt_request():
                 "Accept": "application/json"
             }
             
-            # Send the request to 1minAI API
-            with requests.post(api_url, json=payload, headers=headers, stream=streaming) as response:
-                response.raise_for_status()
-                
-                # Process the response based on streaming or not
-                if streaming:
-                    # Process streaming response
-                    prompt_tokens = len(transcription.split())
-                    total_completion_tokens = 0
+            try:
+                # Send the request to 1minAI API
+                with requests.post(api_url, json=payload, headers=headers, stream=streaming) as response:
+                    response.raise_for_status()
                     
-                    # Yield the initial chunk
-                    initial_response = transform_streaming_chunk({}, messages, original_model)
-                    yield f"data: {json.dumps(initial_response)}\n\n"
-                    
-                    # Process each chunk in the streaming response
-                    for line in response.iter_lines():
-                        if line:
-                            try:
-                                # Try to parse the line as JSON
-                                data = json.loads(line.decode('utf-8'))
-                                transformed_chunk = transform_streaming_chunk(data, messages, original_model)
-                                yield f"data: {json.dumps(transformed_chunk)}\n\n"
-                                
-                                # Count tokens for debugging
-                                if 'content' in data:
-                                    total_completion_tokens += len(data['content'].split())
-                            except Exception as e:
-                                logger.error(f"Error processing streaming chunk: {str(e)}")
-                                # Send error info to client
-                                error_chunk = {
-                                    "id": f"chatcmpl-{uuid.uuid4()}",
-                                    "object": "chat.completion.chunk",
-                                    "created": int(time.time()),
-                                    "model": original_model,
-                                    "choices": [
-                                        {
-                                            "index": 0,
-                                            "delta": {"content": f"\nError: {str(e)}"},
-                                            "finish_reason": "error"
-                                        }
-                                    ]
-                                }
-                                yield f"data: {json.dumps(error_chunk)}\n\n"
-                    
-                    # Send the final [DONE] marker
-                    yield "data: [DONE]\n\n"
-                    
-                    # Log completion for debugging
-                    logger.debug(f"Finished processing streaming response. Completion tokens: {total_completion_tokens}")
-                    logger.debug(f"Total tokens: {prompt_tokens + total_completion_tokens}")
-                else:
-                    # Process non-streaming response
-                    response_data = response.json()
-                    prompt_tokens = len(transcription.split())
-                    
-                    # Transform response
-                    transformed_response = transform_response(response_data, conversation_payload, prompt_tokens)
-                    
-                    # Return response in streaming format for consistency
-                    yield f"data: {json.dumps(transformed_response)}\n\n"
-                    yield "data: [DONE]\n\n"
+                    # Process the response based on streaming or not
+                    if streaming:
+                        # Process streaming response
+                        prompt_tokens = len(transcription.split())
+                        total_completion_tokens = 0
+                        
+                        # Yield the initial chunk
+                        initial_response = transform_streaming_chunk({}, messages, original_model)
+                        yield f"data: {json.dumps(initial_response)}\n\n"
+                        
+                        # Process each chunk in the streaming response
+                        for line in response.iter_lines():
+                            if line:
+                                try:
+                                    # Try to parse the line as JSON
+                                    data = json.loads(line.decode('utf-8'))
+                                    transformed_chunk = transform_streaming_chunk(data, messages, original_model)
+                                    yield f"data: {json.dumps(transformed_chunk)}\n\n"
+                                    
+                                    # Count tokens for debugging
+                                    if 'content' in data:
+                                        total_completion_tokens += len(data['content'].split())
+                                except Exception as e:
+                                    logger.error(f"Error processing streaming chunk: {str(e)}")
+                                    # Send error info to client
+                                    error_chunk = {
+                                        "id": f"chatcmpl-{uuid.uuid4()}",
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()),
+                                        "model": original_model,
+                                        "choices": [
+                                            {
+                                                "index": 0,
+                                                "delta": {"content": f"\nError: {str(e)}"},
+                                                "finish_reason": "error"
+                                            }
+                                        ]
+                                    }
+                                    yield f"data: {json.dumps(error_chunk)}\n\n"
+                        
+                        # Send the final [DONE] marker
+                        yield "data: [DONE]\n\n"
+                        
+                        # Log completion for debugging
+                        logger.debug(f"Finished processing streaming response. Completion tokens: {total_completion_tokens}")
+                        logger.debug(f"Total tokens: {prompt_tokens + total_completion_tokens}")
+                    else:
+                        # Process non-streaming response
+                        response_data = response.json()
+                        prompt_tokens = len(transcription.split())
+                        
+                        # Transform response
+                        transformed_response = transform_response(response_data, {"messages": messages}, prompt_tokens)
+                        
+                        # Return response in streaming format for consistency
+                        yield f"data: {json.dumps(transformed_response)}\n\n"
+                        yield "data: [DONE]\n\n"
+            except requests.exceptions.HTTPError as e:
+                logger.error(f"HTTP error in conversation request: {str(e)}")
+                error_response = {
+                    "id": f"chatcmpl-{uuid.uuid4()}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": original_model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": f"\nError communicating with AI service: {str(e)}"},
+                            "finish_reason": "error"
+                        }
+                    ]
+                }
+                yield f"data: {json.dumps(error_response)}\n\n"
+                yield "data: [DONE]\n\n"
         
         # Return response as a streaming response
         return Response(generate(), mimetype='text/event-stream')
@@ -1036,12 +1061,13 @@ def process_stt_request():
     except Exception as e:
         logger.error(f"Error in STT processing: {str(e)}")
         logger.error(traceback.format_exc())
+        return ERROR_HANDLER(1500, detail=str(e))
+    finally:
         # Clean up the temporary file
         try:
             os.unlink(temp_file_path)
         except:
             pass
-        return ERROR_HANDLER(1500, detail=str(e))
 
 def web_search(query, api_key=None, num_results=5):
     """
@@ -1716,78 +1742,12 @@ def transform_response(one_min_response, request_data, prompt_tokens):
 @app.route('/v1/embeddings', methods=['POST', 'OPTIONS'])
 @limiter.limit("500 per minute")
 def embeddings():
-    """Handle embeddings requests"""
+    """Handle embeddings API requests"""
     if request.method == 'OPTIONS':
         return handle_options_request()
-
-    try:
-        # Get the request data
-        request_data = request.get_json()
-        
-        # Extract API key from Authorization header
-        api_key = extract_api_key()
-        if not api_key:
-            return ERROR_HANDLER(1001)
-        
-        # Validate the input data
-        if not request_data.get('input'):
-            return ERROR_HANDLER(1002, detail="Input is required")
-        
-        model = request_data.get('model', 'text-embedding-ada-002')
-        input_text = request_data.get('input', '')
-        
-        # Prepare the payload for 1minAI API
-        payload = {
-            "type": "EMBEDDINGS",
-            "model": model,
-            "promptObject": {
-                "text": input_text if isinstance(input_text, str) else json.dumps(input_text)
-            }
-        }
-        
-        headers = {
-            "API-KEY": api_key,
-            "Content-Type": "application/json"
-        }
-        
-        logger.info(f"Sending embeddings request to: {ONE_MIN_API_URL}")
-        logger.debug(f"Embeddings payload: {json.dumps(payload)[:200]}...")
-        
-        # Make the request to 1minAI unified API endpoint
-        response = requests.post(ONE_MIN_API_URL, json=payload, headers=headers)
-        response.raise_for_status()
-        
-        one_min_response = response.json()
-        
-        # Transform the response to OpenAI format
-        transformed_response = {
-            "object": "list",
-            "data": [
-                {
-                    "object": "embedding",
-                    "embedding": one_min_response.get('embedding', []),
-                    "index": 0
-                }
-            ],
-            "model": map_model_to_openai(model),
-            "usage": {
-                "prompt_tokens": calculate_token(input_text if isinstance(input_text, str) else json.dumps(input_text)),
-                "total_tokens": calculate_token(input_text if isinstance(input_text, str) else json.dumps(input_text))
-            }
-        }
-        
-        # Return the response
-        flask_response = make_response(jsonify(transformed_response))
-        set_response_headers(flask_response)
-        
-        return flask_response, 200
     
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 401:
-            return ERROR_HANDLER(1020, key="[REDACTED]")
-        return ERROR_HANDLER(1500, detail=str(e))
-    except Exception as e:
-        return ERROR_HANDLER(1500, detail=str(e))
+    # В официальной документации 1min.ai тип EMBEDDINGS не подтвержден
+    return ERROR_HANDLER(1500, detail="Embeddings API is not supported by 1min.ai")
 
 @app.route('/v1/images/generations', methods=['POST', 'OPTIONS'])
 @limiter.limit("500 per minute")
@@ -1864,74 +1824,12 @@ def images_generations():
 @app.route('/v1/moderations', methods=['POST', 'OPTIONS'])
 @limiter.limit("500 per minute")
 def moderations():
-    """Handle content moderation requests"""
+    """Handle moderation API requests"""
     if request.method == 'OPTIONS':
         return handle_options_request()
-
-    try:
-        # Get the request data
-        request_data = request.get_json()
-        
-        # Extract API key from Authorization header
-        api_key = extract_api_key()
-        if not api_key:
-            return ERROR_HANDLER(1001)
-        
-        # Validate the input data
-        if not request_data.get('input'):
-            return ERROR_HANDLER(1002, detail="Input is required")
-        
-        # Prepare the payload for 1minAI API
-        payload = {
-            "type": "MODERATION",
-            "model": request_data.get('model', 'text-moderation-latest'),
-            "promptObject": {
-                "text": request_data.get('input', '')
-            }
-        }
-        
-        headers = {
-            "API-KEY": api_key,
-            "Content-Type": "application/json"
-        }
-        
-        logger.info(f"Sending moderation request to: {ONE_MIN_API_URL}")
-        logger.debug(f"Moderation payload: {json.dumps(payload)[:200]}...")
-        
-        # Make the request to 1minAI unified API endpoint
-        response = requests.post(ONE_MIN_API_URL, json=payload, headers=headers)
-        response.raise_for_status()
-        
-        one_min_response = response.json()
-        
-        # Transform the response to OpenAI format
-        transformed_response = {
-            "id": f"modr-{uuid.uuid4()}",
-            "model": "text-moderation-latest",
-            "results": []
-        }
-        
-        # Process the moderation results
-        if 'results' in one_min_response:
-            for result in one_min_response['results']:
-                transformed_response['results'].append({
-                    "flagged": result.get('flagged', False),
-                    "categories": result.get('categories', {}),
-                    "category_scores": result.get('category_scores', {})
-                })
-        
-        # Return the response
-        flask_response = make_response(jsonify(transformed_response))
-        set_response_headers(flask_response)
-        
-        return flask_response, 200
     
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 401:
-            return ERROR_HANDLER(1020, key="[REDACTED]")
-        return ERROR_HANDLER(1500, detail=str(e))
-    except Exception as e:
-        return ERROR_HANDLER(1500, detail=str(e))
+    # В официальной документации 1min.ai тип MODERATION не подтвержден
+    return ERROR_HANDLER(1500, detail="Moderations API is not supported by 1min.ai")
 
 @app.route('/v1/assistants', methods=['GET', 'POST', 'OPTIONS'])
 @limiter.limit("500 per minute")
@@ -1940,69 +1838,8 @@ def assistants():
     if request.method == 'OPTIONS':
         return handle_options_request()
     
-    # Extract API key from Authorization header
-    api_key = extract_api_key()
-    if not api_key:
-        return ERROR_HANDLER(1001)
-    
-    if request.method == 'GET':
-        # List assistants
-        return ERROR_HANDLER(1500, detail="Assistants API listing is not implemented in this version")
-    
-    elif request.method == 'POST':
-        try:
-            # Create a new assistant
-            request_data = request.get_json()
-            
-            # Prepare payload for 1minAI API
-            payload = {
-                "type": "ASSISTANT_CREATE",
-                "model": request_data.get('model', DEFAULT_MODEL),
-                "promptObject": {
-                    "name": request_data.get('name'),
-                    "description": request_data.get('description'),
-                    "instructions": request_data.get('instructions'),
-                    "tools": request_data.get('tools', [])
-                }
-            }
-            
-            headers = {
-                "API-KEY": api_key,
-                "Content-Type": "application/json"
-            }
-            
-            logger.info(f"Sending assistant creation request to: {ONE_MIN_API_URL}")
-            logger.debug(f"Assistant creation payload: {json.dumps(payload)[:200]}...")
-            
-            # Send request to unified API endpoint
-            response = requests.post(ONE_MIN_API_URL, json=payload, headers=headers)
-            response.raise_for_status()
-            
-            one_min_response = response.json()
-            
-            # Transform to OpenAI format
-            transformed_response = {
-                "id": one_min_response.get('id', f"asst_{uuid.uuid4()}"),
-                "object": "assistant",
-                "created_at": int(time.time()),
-                "name": one_min_response.get('name'),
-                "description": one_min_response.get('description'),
-                "instructions": one_min_response.get('instructions'),
-                "model": map_model_to_openai(one_min_response.get('model')),
-                "tools": one_min_response.get('tools', [])
-            }
-            
-            flask_response = make_response(jsonify(transformed_response))
-            set_response_headers(flask_response)
-            
-            return flask_response, 200
-        
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 401:
-                return ERROR_HANDLER(1020, key="[REDACTED]")
-            return ERROR_HANDLER(1500, detail=str(e))
-        except Exception as e:
-            return ERROR_HANDLER(1500, detail=str(e))
+    # В официальной документации 1min.ai тип ASSISTANT_CREATE не подтвержден
+    return ERROR_HANDLER(1500, detail="Assistants API is not supported by 1min.ai")
 
 @app.route('/v1/files', methods=['GET', 'POST', 'OPTIONS'])
 @limiter.limit("500 per minute")
@@ -2011,181 +1848,8 @@ def files():
     if request.method == 'OPTIONS':
         return handle_options_request()
     
-    # Extract API key from Authorization header
-    api_key = extract_api_key()
-    if not api_key:
-        return ERROR_HANDLER(1001)
-    
-    if request.method == 'GET':
-        # List files
-        try:
-            # Prepare payload for files listing
-            payload = {
-                "type": "FILES_LIST"
-            }
-            
-            headers = {
-                "API-KEY": api_key,
-                "Content-Type": "application/json"
-            }
-            
-            logger.info(f"Sending files list request to: {ONE_MIN_API_URL}")
-            
-            # Send request to unified API endpoint
-            response = requests.post(ONE_MIN_API_URL, json=payload, headers=headers)
-            response.raise_for_status()
-            
-            one_min_response = response.json()
-            
-            # Transform to OpenAI format
-            transformed_response = {
-                "object": "list",
-                "data": []
-            }
-            
-            if 'files' in one_min_response:
-                for file in one_min_response['files']:
-                    transformed_response['data'].append({
-                        "id": file.get('id'),
-                        "object": "file",
-                        "bytes": file.get('size', 0),
-                        "created_at": file.get('created_at', int(time.time())),
-                        "filename": file.get('filename'),
-                        "purpose": file.get('purpose', 'assistants')
-                    })
-            
-            flask_response = make_response(jsonify(transformed_response))
-            set_response_headers(flask_response)
-            
-            return flask_response, 200
-        
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 401:
-                return ERROR_HANDLER(1020, key="[REDACTED]")
-            return ERROR_HANDLER(1500, detail=str(e))
-        except Exception as e:
-            return ERROR_HANDLER(1500, detail=str(e))
-    
-    elif request.method == 'POST':
-        # Upload a file
-        try:
-            # Check if file is present in request
-            if 'file' not in request.files:
-                return ERROR_HANDLER(1002, detail="File is required")
-            
-            file = request.files['file']
-            purpose = request.form.get('purpose', 'assistants')
-            
-            # Check if filename is empty
-            if file.filename == '':
-                return ERROR_HANDLER(1700, detail="Empty filename")
-
-            try:
-                # Check file type - support PDF, TXT, MD, DOCX
-                allowed_mime_types = ['application/pdf', 'text/plain', 'text/markdown', 
-                                     'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                                     'application/msword']
-                
-                # Read file content
-                file_content = file.read()
-                file.seek(0)  # Reset file pointer
-                
-                # Determine MIME type
-                mime_type = file.content_type
-                file_ext = os.path.splitext(file.filename)[1].lower()
-                
-                # Additional checks for text files
-                if not mime_type or mime_type == 'application/octet-stream':
-                    if file_ext in ['.txt', '.md', '.markdown']:
-                        mime_type = 'text/plain'
-                    elif file_ext == '.pdf':
-                        mime_type = 'application/pdf'
-                    elif file_ext == '.docx':
-                        mime_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-                    elif file_ext == '.doc':
-                        mime_type = 'application/msword'
-                
-                if mime_type not in allowed_mime_types:
-                    return ERROR_HANDLER(1700, detail=f"Unsupported file type: {mime_type}")
-                
-                # Process DOC/DOCX files
-                if mime_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' or mime_type == 'application/msword':
-                    logger.debug(f"Processing DOCX/DOC file: {file.filename}")
-                    
-                    # Save temporarily
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
-                        temp_file_path = temp_file.name
-                        temp_file.write(file_content)
-                    
-                    try:
-                        # Extract text
-                        logger.debug(f"Extracting text from file with extension {file_ext}")
-                        if file_ext == '.docx':
-                            # Use docx2txt for DOCX
-                            logger.debug("Using docx2txt to process DOCX file")
-                            try:
-                                text_content = docx2txt.process(temp_file_path)
-                                logger.debug(f"Successfully extracted text from DOCX file, length: {len(text_content)} characters")
-                            except Exception as docx_err:
-                                logger.error(f"Error processing DOCX file with docx2txt: {str(docx_err)}")
-                                text_content = "Error extracting text from DOCX file."
-                        else:
-                            # Use python-docx for DOC (with conversion limitations)
-                            logger.debug("Using python-docx to process DOC file")
-                            try:
-                                doc = DocxDocument(temp_file_path)
-                                text_content = "\n".join([para.text for para in doc.paragraphs])
-                                logger.debug(f"Successfully extracted text from DOC file, length: {len(text_content)} characters")
-                            except Exception as doc_err:
-                                logger.error(f"Error processing DOC file with python-docx: {str(doc_err)}")
-                                text_content = "Error extracting text from DOC file. Please convert to DOCX or PDF format."
-                        
-                        # Create a text file with the extracted content
-                        text_filename = os.path.splitext(file.filename)[0] + ".txt"
-                        text_file_io = BytesIO(text_content.encode('utf-8'))
-                        
-                        # Upload the text file instead
-                        logger.debug(f"Uploading converted text file: {text_filename}")
-                        upload_result = upload_file_to_1min(text_file_io, text_filename, 'text/plain', api_key)
-                        
-                        # Add a note about the conversion for the original request
-                        logger.debug(f"Adding note about file conversion from {file.filename} to {text_filename}")
-                        original_filename = file.filename
-                    finally:
-                        # Clean up
-                        if os.path.exists(temp_file_path):
-                            os.unlink(temp_file_path)
-                else:
-                    # Process other file types directly
-                    file_io = BytesIO(file_content)
-                    upload_result = upload_file_to_1min(file_io, file.filename, mime_type, api_key)
-                
-                # Format response in OpenAI format
-                transformed_response = {
-                    "id": upload_result['id'],
-                    "object": "file",
-                    "bytes": len(file_content),
-                    "created_at": int(time.time()),
-                    "filename": upload_result['name'],
-                    "purpose": purpose,
-                    "status": "processed"
-                }
-                
-                flask_response = make_response(jsonify(transformed_response))
-                set_response_headers(flask_response)
-                
-                return flask_response, 200
-            
-            except Exception as file_error:
-                logger.error(f"Error processing file: {str(file_error)}")
-                return ERROR_HANDLER(1700, detail=f"Error processing file: {str(file_error)}")
-            
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 401:
-                return ERROR_HANDLER(1020, key="[REDACTED]")
-            return ERROR_HANDLER(1500, detail=str(e))
-        except Exception as e:
-            return ERROR_HANDLER(1500, detail=str(e))
+    # В официальной документации 1min.ai тип FILES_LIST не подтвержден
+    return ERROR_HANDLER(1500, detail="Files API is not supported by 1min.ai")
 
 def upload_file_to_1min(file_data, file_name, mime_type, api_key):
     """
