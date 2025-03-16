@@ -999,155 +999,145 @@ def process_stt_request():
         # Log the final request
         logger.debug(f"Sending request to {api_url} with payload: {json.dumps(payload)[:200]}...")
         
-        def generate():
-            # Захватываем значение streaming из внешней области видимости
-            is_streaming = False  # Всегда используем неитеративный подход для голосовых сообщений
+        # Убираем сложную логику с генератором и стримингом, заменяем её на простой запрос и ответ
+        # Set up headers for the API request
+        headers = {
+            "API-KEY": api_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+        
+        try:
+            # Используем неитеративный подход
+            logger.info(f"Using non-streaming approach for audio response with model {original_model}")
+            response = requests.post(api_url, json=payload, headers=headers)
+            response.raise_for_status()
             
-            # Set up headers for the API request
-            headers = {
-                "API-KEY": api_key,
-                "Content-Type": "application/json",
-                "Accept": "application/json"
+            # Get the response
+            response_data = response.json()
+            logger.debug(f"Received non-streaming response: {json.dumps(response_data)[:200]}...")
+            
+            # Извлекаем контент из ответа - ищем его в разных местах JSON, аналогично тому, 
+            # как мы делаем для транскрипции
+            content = ""
+            
+            # Сначала ищем прямое поле content в корне ответа
+            if "content" in response_data:
+                content = response_data.get('content', '')
+            
+            # Если контента нет, ищем в aiRecord
+            if not content and "aiRecord" in response_data:
+                ai_record = response_data["aiRecord"]
+                
+                # Проверяем наличие aiRecordDetail
+                if "aiRecordDetail" in ai_record:
+                    details = ai_record["aiRecordDetail"]
+                    
+                    # Ищем в resultObject
+                    if "resultObject" in details:
+                        result_obj = details["resultObject"]
+                        if isinstance(result_obj, list) and result_obj:
+                            # Объединяем все строки из массива
+                            content = "".join(result_obj)
+                        elif isinstance(result_obj, str):
+                            content = result_obj
+                        elif isinstance(result_obj, dict):
+                            # Если это словарь, ищем в нем текстовые поля
+                            for field in ["text", "content", "message", "response"]:
+                                if field in result_obj and result_obj[field]:
+                                    content = result_obj[field]
+                                    break
+            
+            # Если все еще не нашли контент, используем дефолтное сообщение
+            if not content:
+                logger.warning(f"Empty content in response: {json.dumps(response_data)[:200]}...")
+                content = "Я не смог обработать ваш запрос. Пожалуйста, попробуйте еще раз."
+            
+            logger.info(f"Extracted content from response: {content[:100]}...")
+            
+            # Create completion response
+            completion_id = f"chatcmpl-{uuid.uuid4()}"
+            prompt_tokens = len(transcription.split())
+            completion_tokens = len(content.split())
+            
+            # Create OpenAI-compatible response
+            completion_response = {
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": original_model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": content
+                        },
+                        "finish_reason": "stop"
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens
+                }
             }
             
-            try:
-                # Используем неитеративный подход
-                logger.info(f"Using non-streaming approach for audio response with model {original_model}")
-                try:
-                    response = requests.post(api_url, json=payload, headers=headers)
-                    response.raise_for_status()
-                    
-                    # Get the response
-                    response_data = response.json()
-                    logger.debug(f"Received non-streaming response: {json.dumps(response_data)[:200]}...")
-                    
-                    # Извлекаем контент из ответа - ищем его в разных местах JSON, аналогично тому, 
-                    # как мы делаем для транскрипции
-                    content = ""
-                    
-                    # Сначала ищем прямое поле content в корне ответа
-                    if "content" in response_data:
-                        content = response_data.get('content', '')
-                    
-                    # Если контента нет, ищем в aiRecord
-                    if not content and "aiRecord" in response_data:
-                        ai_record = response_data["aiRecord"]
-                        
-                        # Проверяем наличие aiRecordDetail
-                        if "aiRecordDetail" in ai_record:
-                            details = ai_record["aiRecordDetail"]
-                            
-                            # Ищем в resultObject
-                            if "resultObject" in details:
-                                result_obj = details["resultObject"]
-                                if isinstance(result_obj, list) and result_obj:
-                                    # Объединяем все строки из массива
-                                    content = "".join(result_obj)
-                                elif isinstance(result_obj, str):
-                                    content = result_obj
-                                elif isinstance(result_obj, dict):
-                                    # Если это словарь, ищем в нем текстовые поля
-                                    for field in ["text", "content", "message", "response"]:
-                                        if field in result_obj and result_obj[field]:
-                                            content = result_obj[field]
-                                            break
-                    
-                    # Если все еще не нашли контент, используем дефолтное сообщение
-                    if not content:
-                        logger.warning(f"Empty content in response: {json.dumps(response_data)[:200]}...")
-                        content = "Я не смог обработать ваш запрос. Пожалуйста, попробуйте еще раз."
-                    
-                    logger.info(f"Extracted content from response: {content[:100]}...")
-                    
-                    # Create completion response
-                    completion_id = f"chatcmpl-{uuid.uuid4()}"
-                    prompt_tokens = len(transcription.split())
-                    completion_tokens = len(content.split())
-                    
-                    # Create OpenAI-compatible response
-                    completion_response = {
-                        "id": completion_id,
-                        "object": "chat.completion",
-                        "created": int(time.time()),
-                        "model": original_model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "message": {
-                                    "role": "assistant",
-                                    "content": content
-                                },
-                                "finish_reason": "stop"
-                            }
-                        ],
-                        "usage": {
-                            "prompt_tokens": prompt_tokens,
-                            "completion_tokens": completion_tokens,
-                            "total_tokens": prompt_tokens + completion_tokens
-                        }
-                    }
-                    
-                    # Format as streaming response for consistency
-                    yield f"data: {json.dumps(completion_response)}\n\n"
-                    yield "data: [DONE]\n\n"
-                    
-                    logger.debug(f"Successfully processed audio response with {completion_tokens} tokens")
-                    
-                except requests.exceptions.HTTPError as e:
-                    logger.error(f"HTTP error in non-streaming request: {str(e)}")
-                    error_response = {
-                        "id": f"chatcmpl-{uuid.uuid4()}",
-                        "object": "chat.completion",
-                        "created": int(time.time()),
-                        "model": original_model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "message": {
-                                    "role": "assistant",
-                                    "content": f"Произошла ошибка при обработке запроса: {str(e)}"
-                                },
-                                "finish_reason": "error"
-                            }
-                        ],
-                        "usage": {
-                            "prompt_tokens": len(transcription.split()),
-                            "completion_tokens": 20,
-                            "total_tokens": len(transcription.split()) + 20
-                        }
-                    }
-                    yield f"data: {json.dumps(error_response)}\n\n"
-                    yield "data: [DONE]\n\n"
+            logger.debug(f"Successfully processed audio response with {completion_tokens} tokens")
             
-            except Exception as e:
-                logger.error(f"General error in generate function: {str(e)}")
-                logger.error(traceback.format_exc())
-                error_response = {
-                    "id": f"chatcmpl-{uuid.uuid4()}",
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": original_model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": f"Произошла неизвестная ошибка: {str(e)}"
-                            },
-                            "finish_reason": "error"
-                        }
-                    ],
-                    "usage": {
-                        "prompt_tokens": len(transcription.split()),
-                        "completion_tokens": 10,
-                        "total_tokens": len(transcription.split()) + 10
+            # Return regular JSON response instead of streaming
+            return jsonify(completion_response)
+            
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP error in non-streaming request: {str(e)}")
+            error_response = {
+                "id": f"chatcmpl-{uuid.uuid4()}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": original_model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": f"Произошла ошибка при обработке запроса: {str(e)}"
+                        },
+                        "finish_reason": "error"
                     }
+                ],
+                "usage": {
+                    "prompt_tokens": len(transcription.split()),
+                    "completion_tokens": 20,
+                    "total_tokens": len(transcription.split()) + 20
                 }
-                yield f"data: {json.dumps(error_response)}\n\n"
-                yield "data: [DONE]\n\n"
+            }
+            return jsonify(error_response)
         
-        # Return response as a streaming response
-        return Response(generate(), mimetype='text/event-stream')
+        except Exception as e:
+            logger.error(f"General error in processing: {str(e)}")
+            logger.error(traceback.format_exc())
+            error_response = {
+                "id": f"chatcmpl-{uuid.uuid4()}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": original_model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": f"Произошла неизвестная ошибка: {str(e)}"
+                        },
+                        "finish_reason": "error"
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": len(transcription.split()),
+                    "completion_tokens": 10,
+                    "total_tokens": len(transcription.split()) + 10
+                }
+            }
+            return jsonify(error_response)
     
     except Exception as e:
         logger.error(f"Error in STT processing: {str(e)}")
