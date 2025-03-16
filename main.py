@@ -823,7 +823,10 @@ def process_stt_request():
     # Get the originally requested model (which will process the transcribed text)
     original_model = request.form.get('model', 'gpt-4o-mini')
     logger.info(f"Original model requested: {original_model}")
-    logger.info(f"Processing audio file: {audio_file.filename} with whisper-1 for transcription")
+    
+    # Для STT всегда используем whisper-1
+    model = "whisper-1"
+    logger.info(f"Processing audio file: {audio_file.filename} with {model} for transcription")
     
     # Save the file temporarily
     with tempfile.NamedTemporaryFile(delete=False) as temp_file:
@@ -899,6 +902,7 @@ def process_stt_request():
             return jsonify({"error": "Invalid response format from 1minAI API"}), 500
         
         # Если требуется также получить ответ на транскрибированный текст
+        response_model = request.form.get('response_model', None)
         if response_model:
             logger.info(f"Forwarding transcribed text to original model: {response_model}")
             
