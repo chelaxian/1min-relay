@@ -904,15 +904,18 @@ def web_search(query, api_key=None, num_results=5):
         from duckduckgo_search import DDGS
         
         results = []
-        with DDGS() as ddgs:
-            ddgs_gen = ddgs.text(query, safesearch='Off', timelimit='y', backend="lite")
-            for r in islice(ddgs_gen, num_results):
-                results.append({
-                    "title": r.get('title', ''),
-                    "url": r.get('link', ''),
-                    "snippet": r.get('body', ''),
-                    "date": ''
-                })
+        try:
+            with DDGS() as ddgs:
+                ddgs_results = list(ddgs.text(query, max_results=num_results))
+                for r in ddgs_results:
+                    results.append({
+                        "title": r.get('title', ''),
+                        "url": r.get('href', ''),
+                        "snippet": r.get('body', ''),
+                        "date": r.get('published', '')
+                    })
+        except Exception as ddg_err:
+            logger.error(f"DuckDuckGo search error: {str(ddg_err)}")
         
         logger.info(f"DuckDuckGo search returned {len(results)} results")
         return {
@@ -930,13 +933,13 @@ def web_search(query, api_key=None, num_results=5):
                 
                 results = []
                 with DDGS() as ddgs:
-                    ddgs_gen = ddgs.text(query, safesearch='Off', timelimit='y', backend="lite")
-                    for r in islice(ddgs_gen, num_results):
+                    ddgs_results = list(ddgs.text(query, max_results=num_results))
+                    for r in ddgs_results:
                         results.append({
                             "title": r.get('title', ''),
-                            "url": r.get('link', ''),
+                            "url": r.get('href', ''),
                             "snippet": r.get('body', ''),
-                            "date": ''
+                            "date": r.get('published', '')
                         })
                 
                 logger.info(f"DuckDuckGo fallback search returned {len(results)} results")
@@ -1056,19 +1059,28 @@ def conversation():
         # Для поддерживаемых моделей автоматически добавляем стандартные инструменты
         if model in tools_supported_models:
             # Добавляем стандартные инструменты, если они не указаны явно
+            standard_tools = [
+                {"type": "function", "function": {"name": "get_datetime", "description": "Get current date and time"}},
+                {"type": "function", "function": {"name": "execute_python", "description": "Execute Python code"}},
+                {"type": "function", "function": {"name": "web_search", "description": "Search the web"}}
+            ]
+            
+            # Если инструменты не заданы, используем стандартные
             if not base_tools:
-                base_tools = [
-                    {"type": "function", "function": {"name": "get_datetime", "description": "Get current date and time"}},
-                    {"type": "function", "function": {"name": "execute_python", "description": "Execute Python code"}},
-                    {"type": "function", "function": {"name": "web_search", "description": "Search the web"}}
-                ]
+                base_tools = standard_tools
+            # Иначе добавляем стандартные, если их еще нет
+            else:
+                existing_tool_names = [t.get('function', {}).get('name', '') for t in base_tools if t.get('type') == 'function']
+                for std_tool in standard_tools:
+                    if std_tool['function']['name'] not in existing_tool_names:
+                        base_tools.append(std_tool)
             
             tools_config = process_tools(
                 base_tools,
                 request_data.get('tool_choice', 'auto'),
                 model
             )
-            logger.info(f"Added tools configuration for supported model {model}")
+            logger.info(f"Added tools configuration for supported model {model}: {[t.get('function', {}).get('name', '') for t in base_tools if t.get('type') == 'function']}")
         else:
             # Для неподдерживаемых моделей пробуем обработать только явно указанные инструменты
             if base_tools:
@@ -2069,6 +2081,8 @@ def execute_python_code(code, timeout=10):
         dict: Execution result with stdout, stderr and execution status
     """
     try:
+        logger.info(f"Executing Python code: {code[:100]}{'...' if len(code) > 100 else ''}")
+        
         # Create a string buffer to capture output
         output = io.StringIO()
         error = io.StringIO()
@@ -2077,21 +2091,63 @@ def execute_python_code(code, timeout=10):
         sys.stdout = output
         sys.stderr = error
         
+        # Create safe globals
+        safe_globals = {
+            '__builtins__': {
+                name: getattr(__builtins__, name)
+                for name in ['abs', 'all', 'any', 'ascii', 'bin', 'bool', 'bytearray', 'bytes',
+                             'chr', 'complex', 'dict', 'dir', 'divmod', 'enumerate', 'filter',
+                             'float', 'format', 'frozenset', 'hash', 'hex', 'int', 'isinstance',
+                             'issubclass', 'iter', 'len', 'list', 'map', 'max', 'min', 'next',
+                             'object', 'oct', 'ord', 'pow', 'print', 'range', 'repr', 'reversed',
+                             'round', 'set', 'slice', 'sorted', 'str', 'sum', 'tuple', 'type',
+                             'zip']
+            }
+        }
+        
+        # Add some safe modules
+        for module_name in ['math', 'random', 'datetime', 're', 'json', 'collections']:
+            try:
+                safe_globals[module_name] = __import__(module_name)
+            except ImportError:
+                pass
+        
         # Execute the code
         try:
-            exec(code, {'__builtins__': __builtins__}, {})
+            # Create a thread to execute the code with timeout
+            def exec_code():
+                exec(code, safe_globals, {})
+            
+            import threading
+            thread = threading.Thread(target=exec_code)
+            thread.daemon = True
+            
+            thread.start()
+            thread.join(timeout)
+            
+            if thread.is_alive():
+                # Timeout occurred
+                logger.warning(f"Python code execution timed out after {timeout} seconds")
+                return {
+                    "status": "timeout",
+                    "stdout": output.getvalue(),
+                    "stderr": f"Execution timed out after {timeout} seconds",
+                    "return_code": -1
+                }
+            
             result = {
                 "status": "success",
                 "stdout": output.getvalue(),
                 "stderr": error.getvalue(),
                 "return_code": 0
             }
+            logger.info(f"Python code executed successfully: {result['stdout'][:100]}{'...' if len(result['stdout']) > 100 else ''}")
         except Exception as e:
             result = {
                 "status": "error",
                 "stdout": output.getvalue(),
                 "stderr": str(e),
-                "return_code": 1
+                "return_code": -1
             }
         
         # Restore stdout and stderr
