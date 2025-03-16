@@ -37,6 +37,7 @@ import multiprocessing
 import signal
 from contextlib import contextmanager
 from functools import wraps
+import copy
 
 # Suppress warnings from flask_limiter
 warnings.filterwarnings("ignore", category=UserWarning, module="flask_limiter.extension")
@@ -272,6 +273,7 @@ def ERROR_HANDLER(code, model=None, key=None, detail=None):
         1500: {"message": f"1minAI API error: {detail}", "type": "api_error", "param": None, "code": "api_error", "http_code": 500},
         1600: {"message": f"Unsupported feature: {detail}", "type": "invalid_request_error", "param": None, "code": "unsupported_feature", "http_code": 400},
         1700: {"message": f"Invalid file format: {detail}", "type": "invalid_request_error", "param": None, "code": "invalid_file_format", "http_code": 400},
+        1400: {"message": f"Invalid request format: {detail}", "type": "invalid_request_error", "param": None, "code": "invalid_request_format", "http_code": 400},
     }
     error_data = {k: v for k, v in error_codes.get(code, {"message": f"Unknown error: {detail}" if detail else "Unknown error", "type": "unknown_error", "param": None, "code": None}).items() if k != "http_code"} # Remove http_code from the error data
     logger.error(f"An error has occurred while processing the user's request. Error code: {code}")
@@ -491,138 +493,194 @@ def extract_images_from_message(messages, api_key, model):
     
     return user_input, image_paths, image
 
-def process_tools(tools, tool_choice, model):
-    """
-    Process tools (function calling) for compatible models
+def process_tools(request_data):
+    """Process tools configuration for the request"""
+    model = request_data.get('model')
+    logger.debug(f"Processing tools for model: {model}")
     
-    Args:
-        tools (list): List of tool definitions
-        tool_choice (str/dict): Tool choice configuration
-        model (str): Model name
+    # Извлечем последнее сообщение пользователя для анализа
+    user_message = ""
+    messages = request_data.get('messages', [])
+    if messages and messages[-1].get('role') == 'user':
+        user_content = messages[-1].get('content', '')
+        if isinstance(user_content, list):
+            # Для мультимодальных запросов извлекаем текст
+            user_message = ' '.join([item.get('text', '') for item in user_content if item.get('type') == 'text'])
+        else:
+            user_message = user_content
     
-    Returns:
-        dict: 1minAI compatible tools configuration
-    """
-    # Всегда пытаемся обработать инструменты, даже если модель не в списке поддерживаемых
-    try:
-        if tools:
-            logger.info(f"Processing {len(tools)} tools for model {model}")
-            
-            # Default tools for all models - добавляем только если нет инструментов
-            default_tools = [
-                {
-                    "name": "get_current_datetime",
-                    "description": "Get the current date and time in various formats",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "format": {
-                                "type": "string",
-                                "description": "Date format (default: ISO format). Options: iso, rfc, human, unix"
-                            },
-                            "timezone": {
-                                "type": "string",
-                                "description": "Timezone (default: UTC). Example: Europe/London, America/New_York"
-                            }
-                        },
-                        "required": []
-                    }
-                },
-                {
+    # Проверяем явные запросы на инструменты в сообщении
+    python_keywords = ['python', 'код', 'code', 'выполни', 'запусти', 'run', 'execute']
+    search_keywords = ['поиск', 'найди', 'search', 'web', 'интернет', 'погода', 'weather']
+    
+    contains_python_request = any(kw.lower() in user_message.lower() for kw in python_keywords)
+    contains_search_request = any(kw.lower() in user_message.lower() for kw in search_keywords)
+    
+    # Логирование запросов на инструменты
+    if contains_python_request:
+        logger.info(f"Detected Python code execution request in user message")
+    if contains_search_request:
+        logger.info(f"Detected web search request in user message")
+    
+    # Списки моделей, которые поддерживают вызов инструментов
+    tool_supported_models = ["gpt-3.5-turbo-0125", "gpt-3.5-turbo", "gpt-4-turbo", "gpt-4-turbo-preview", 
+                          "gpt-4o", "gpt-4o-mini", "claude-3-opus-20240229", "claude-3-sonnet-20240229", 
+                          "claude-3-haiku-20240307", "claude-3-5-sonnet-20240620"]
+    
+    # Проверяем, есть ли явные настройки инструментов в запросе
+    tools = request_data.get('tools')
+    tool_choice = request_data.get('tool_choice')
+    
+    # Добавление инструментов на основе ключевых слов в сообщении
+    if not tools and (contains_python_request or contains_search_request):
+        tools = []
+        
+        if contains_python_request:
+            logger.info("Automatically enabling Python code execution based on user message")
+            tools.append({
+                "type": "function",
+                "function": {
                     "name": "execute_python",
-                    "description": "Execute Python code and return the result",
+                    "description": "Executes Python code and returns the output",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "code": {
                                 "type": "string",
-                                "description": "Python code to execute"
-                            },
-                            "timeout": {
-                                "type": "integer",
-                                "description": "Maximum execution time in seconds (default: 10)"
+                                "description": "The Python code to execute"
                             }
                         },
                         "required": ["code"]
                     }
-                },
-                {
+                }
+            })
+        
+        if contains_search_request:
+            logger.info("Automatically enabling web search based on user message")
+            tools.append({
+                "type": "function",
+                "function": {
                     "name": "web_search",
-                    "description": "Search the web for information",
+                    "description": "Search the web for real-time information",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "query": {
+                            "search_term": {
                                 "type": "string",
-                                "description": "Search query"
-                            },
-                            "num_results": {
-                                "type": "integer",
-                                "description": "Number of results to return (default: 5)"
+                                "description": "The search term to look up on the web"
                             }
                         },
-                        "required": ["query"]
+                        "required": ["search_term"]
                     }
                 }
-            ]
-            
-            # Объединяем пользовательские инструменты со стандартными, только если нет пользовательских
-            combined_tools = tools if tools else default_tools
-        else:
-            # Если модель не поддерживает tools и инструменты не предоставлены, возвращаем None
-            if model not in tools_supported_models:
-                logger.warning(f"Model {model} does not officially support tool use, and no tools were provided")
-                return None
-                
-            # Для поддерживаемых моделей используем стандартные инструменты
-            combined_tools = default_tools
-            logger.info(f"Using default tools for model {model}")
-    except Exception as e:
-        logger.error(f"Error preparing tools: {str(e)}")
-        return None
+            })
     
-    # Convert OpenAI tools format to 1minAI format
-    one_min_tools = []
-    
-    for tool in combined_tools:
-        try:
-            # Currently only 'function' type is supported
-            if tool.get('type', 'function') == 'function':
-                function_def = tool.get('function', tool)  # Handle both formats
-                one_min_tool = {
-                    "name": function_def.get('name', ''),
-                    "description": function_def.get('description', ''),
-                    "parameters": function_def.get('parameters', {})
+    # Если инструменты не указаны, но модель поддерживает их, добавим стандартные инструменты
+    if not tools and model in tool_supported_models:
+        logger.debug(f"Adding default tools for supported model {model}")
+        tools = [
+            {
+                "type": "function", 
+                "function": {
+                    "name": "get_current_datetime",
+                    "description": "Get the current date and time",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
                 }
-                one_min_tools.append(one_min_tool)
-            elif 'name' in tool and 'description' in tool and 'parameters' in tool:
-                # Обрабатываем old-style функции напрямую
-                one_min_tools.append(tool)
-        except Exception as e:
-            logger.warning(f"Error processing tool {tool}: {str(e)}")
-            # Пропускаем проблемный инструмент и продолжаем с остальными
-            continue
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "execute_python",
+                    "description": "Executes Python code and returns the output",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "code": {
+                                "type": "string",
+                                "description": "The Python code to execute"
+                            }
+                        },
+                        "required": ["code"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "description": "Search the web for real-time information",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "search_term": {
+                                "type": "string",
+                                "description": "The search term to look up on the web"
+                            }
+                        },
+                        "required": ["search_term"]
+                    }
+                }
+            }
+        ]
     
-    # Process tool_choice
-    auto_invoke = True  # Default
-    if tool_choice == "none":
-        auto_invoke = False
-    elif isinstance(tool_choice, dict) and tool_choice.get('type') == 'function':
-        # Specific function is requested
-        # 1minAI doesn't directly support this, but we can add this to the prompt
-        pass
+    # Если инструменты не указаны и модель не поддерживает их, вернем None
+    if not tools:
+        logger.debug(f"No tools configured for model {model}")
+        return None, None, False
     
-    # Проверяем, что у нас есть инструменты после обработки
-    if not one_min_tools:
-        logger.warning("No valid tools after processing")
-        return None
-        
-    logger.info(f"Successfully processed {len(one_min_tools)} tools")
+    # Проверка и преобразование инструментов
+    tools_config = []
+    for tool in tools:
+        # Если инструмент в формате OpenAI, преобразуем его в формат 1minAI
+        if 'type' in tool and tool['type'] == 'function' and 'function' in tool:
+            function_info = tool['function']
+            function_name = function_info.get('name')
+            
+            if function_name:
+                logger.debug(f"Processing tool: {function_name}")
+                tools_config.append({
+                    'name': function_name,
+                    'description': function_info.get('description', ''),
+                    'parameters': function_info.get('parameters', {})
+                })
     
-    return {
-        "tools": one_min_tools,
-        "autoInvoke": auto_invoke
-    }
+    # Обработка tool_choice
+    has_forced_tool = False
+    tool_type_mentioned = None
+    
+    # Если есть явный выбор инструмента
+    if tool_choice:
+        if tool_choice == "auto":
+            logger.debug("Using automatic tool choice")
+        elif tool_choice == "none":
+            logger.debug("Tool choice set to none, disabling tools")
+            return None, None, False
+        elif isinstance(tool_choice, dict) and 'type' in tool_choice and tool_choice['type'] == 'function':
+            # Форсируем использование конкретного инструмента
+            function_name = tool_choice.get('function', {}).get('name')
+            if function_name:
+                logger.info(f"Forcing tool choice: {function_name}")
+                has_forced_tool = True
+                tool_type_mentioned = function_name
+    
+    # Если нет явного выбора, но есть ключевые слова, попробуем определить инструмент
+    if not has_forced_tool:
+        if contains_python_request:
+            tool_type_mentioned = "execute_python"
+            has_forced_tool = True
+        elif contains_search_request:
+            tool_type_mentioned = "web_search"
+            has_forced_tool = True
+    
+    logger.info(f"Configured {len(tools_config)} tools for model {model}")
+    if has_forced_tool:
+        logger.info(f"Forcing tool choice: {tool_type_mentioned}")
+    
+    return tools_config, tool_type_mentioned, has_forced_tool
 
 def handle_get_datetime(params):
     """
@@ -1115,188 +1173,96 @@ def audio_speech():
 @app.route('/v1/chat/completions', methods=['POST', 'OPTIONS'])
 @limiter.limit("500 per minute")
 def conversation():
-    if request.method == 'OPTIONS':
-        return handle_options_request()
+    """
+    Main endpoint for the OpenAI-compatible API conversation
+    """
+    # Parse request data and validate
+    if not request.is_json:
+        return ERROR_HANDLER(1400, detail="Request must be JSON")
     
-    auth_header = request.headers.get('Authorization')
-    if not auth_header or not auth_header.startswith("Bearer "):
-        logger.error("Invalid Authentication")
-        return ERROR_HANDLER(1021)
-    
-    api_key = auth_header.split(" ")[1]
-    request_data = request.json
-    
-    headers = {
-        "API-KEY": api_key, 
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream" if request_data.get('stream', False) else "application/json"
-    }
+    request_data = request.get_json()
+    if 'messages' not in request_data or not isinstance(request_data['messages'], list):
+        return ERROR_HANDLER(1400, detail="Missing messages field or not a list")
     
     # Get model
-    model = request_data.get('model', 'mistral-nemo')
+    model = request_data.get('model', DEFAULT_MODEL)
+    logger.debug(f"Received conversation request for model {model}")
     
-    # Check to see if the TTS model is a model
-    # if model in tts_supported_models:
-    #     return ERROR_HANDLER(1600, detail="TTS models can only be used with the /v1/audio/speech endpoint")
-    
-    if PERMIT_MODELS_FROM_SUBSET_ONLY and model not in AVAILABLE_MODELS:
-        return ERROR_HANDLER(1002, model)
-    
-    # Get messages
-    messages = request_data.get('messages', [])
-    if not messages:
-        return ERROR_HANDLER(1412)
-    
-    # Add system info to last user message if it was a converted DOC/DOCX file
-    last_message = messages[-1]
-    if last_message.get('role') == 'user' and 'doc_file_conversion' in request.headers:
-        original_filename = request.headers.get('doc_file_conversion')
-        # Only modify content if it's a string
-        if isinstance(last_message.get('content'), str):
-            logger.debug(f"Adding note about DOC/DOCX conversion for file: {original_filename}")
-            last_message['content'] += f"\n\n(Примечание: Этот текст был извлечен из файла {original_filename}. Некоторое форматирование могло быть потеряно при конвертации.)"
+    # Clone the request data to avoid modifying the original
+    request_data_clone = copy.deepcopy(request_data)
     
     # Extract system message if present
-    system_prompt = None
+    system_message = None
+    messages = request_data_clone.get('messages', [])
+    
+    if messages and messages[0].get('role') == 'system':
+        system_message = messages[0].get('content', '')
+        logger.debug(f"System message detected, length: {len(system_message)}")
+    
+    # Process tools configuration
+    tools_config, tool_type_mentioned, has_tools_request = process_tools(request_data_clone)
+    if tools_config:
+        logger.info(f"Adding {len(tools_config)} tools to request for model {model}")
+        if tool_type_mentioned:
+            logger.info(f"Tool type mentioned: {tool_type_mentioned}")
+    
+    # Process user input from the last user message
+    user_input, image_paths, has_image = process_user_input(messages)
+    
+    # Process multimodal content
+    if has_image:
+        logger.debug("Request contains images, processing as multimodal content")
+    
+    # Count input tokens
+    prompt_token = calculate_token(' '.join([msg.get('content', '') for msg in messages if isinstance(msg.get('content'), str)]), model)
+    
+    # Prepare final messages for 1minAI API
+    all_messages = []
     for msg in messages:
-        if msg.get('role') == 'system':
-            system_prompt = msg.get('content', '')
-            break
-    
-    # Extract user input from the last message
-    try:
-        user_input, image_paths, has_image = extract_images_from_message(messages, api_key, model)
-    except Exception as e:
-        logger.error(f"Error extracting images: {str(e)}")
-        # If an error occurs during image processing, continue without images
-        user_input = messages[-1].get('content', '')
-        if isinstance(user_input, list):
-            # Merge the text parts of the message
-            text_parts = []
-            for item in user_input:
-                if 'text' in item:
-                    text_parts.append(item['text'])
-                elif 'type' in item and item['type'] == 'text':
-                    text_parts.append(item.get('text', ''))
-            user_input = '\n'.join(text_parts)
+        role = msg.get('role')
+        content = msg.get('content')
         
-        image_paths = []
-        has_image = False
+        # Skip system message as it's handled separately
+        if role == 'system':
+            continue
         
-        if not user_input:
-            return ERROR_HANDLER(1423)
-    
-    # Format conversation history
-    all_messages = format_conversation_history(messages, user_input, system_prompt)
-    prompt_token = calculate_token(str(all_messages))
-    
-    # Process tools (function calling)
-    tools_config = None
-    try:
-        # Определяем базовый набор инструментов
-        base_tools = request_data.get('tools', [])
-        
-        # Список функций, которые будем добавлять
-        standard_tool_functions = {
-            "get_datetime": {"name": "get_datetime", "description": "Get current date and time"},
-            "execute_python": {"name": "execute_python", "description": "Execute Python code"},
-            "web_search": {"name": "web_search", "description": "Search the web"}
-        }
-        
-        # Для поддерживаемых моделей автоматически добавляем стандартные инструменты
-        if model in tools_supported_models:
-            # Преобразуем в стандартный формат OpenAI для tools
-            standard_tools = [
-                {"type": "function", "function": func_def} 
-                for func_name, func_def in standard_tool_functions.items()
-            ]
-            
-            # Если инструменты не заданы, используем стандартные
-            if not base_tools:
-                base_tools = standard_tools
-                logger.info(f"No tools provided, adding standard tools for model {model}")
-            # Иначе добавляем стандартные, если их еще нет
+        if role == 'user' or role == 'assistant':
+            # For multimodal content
+            if isinstance(content, list):
+                # Content is a list of objects, handle text and image separately
+                msg_content = ""
+                for item in content:
+                    if item.get('type') == 'text':
+                        msg_content += item.get('text', '')
+                
+                all_messages.append({"role": role, "content": msg_content})
             else:
-                existing_tool_names = set()
-                
-                for tool in base_tools:
-                    if tool.get('type') == 'function':
-                        func_name = tool.get('function', {}).get('name', '')
-                        if func_name:
-                            existing_tool_names.add(func_name)
-                    elif 'name' in tool:  # Обрабатываем и old-style функции
-                        existing_tool_names.add(tool['name'])
-                
-                # Добавляем недостающие стандартные инструменты
-                for func_name, func_def in standard_tool_functions.items():
-                    if func_name not in existing_tool_names:
-                        base_tools.append({"type": "function", "function": func_def})
-                        logger.info(f"Adding standard tool {func_name} to request for model {model}")
-            
-            # Обрабатываем инструменты
-            tools_config = process_tools(
-                base_tools,
-                request_data.get('tool_choice', 'auto'),
-                model
-            )
-            logger.info(f"Added tools configuration for model {model}: {', '.join([t.get('function', {}).get('name', t.get('name', '')) for t in base_tools if t.get('type') == 'function' or 'name' in t])}")
-        else:
-            # Для неподдерживаемых моделей пробуем обработать только явно указанные инструменты
-            if base_tools:
-                try:
-                    # Попытка добавить инструменты даже для неподдерживаемых моделей
-                    tools_config = process_tools(
-                        base_tools,
-                        request_data.get('tool_choice', 'auto'),
-                        model
-                    )
-                    logger.warning(f"Processing tools for potentially unsupported model {model} - attempting anyway")
-                except Exception as tool_e:
-                    logger.warning(f"Failed to process tools for model {model}: {str(tool_e)}")
-                    # Продолжаем без инструментов
-                    pass
-    except Exception as e:
-        logger.error(f"Error processing tools: {str(e)}")
-        # Продолжаем без инструментов при ошибке
-        pass
-    
-    # Check for web search
-    use_web_search = request_data.get('web_search', False)
-    # Автоматически включаем веб-поиск для поддерживаемых моделей, если в запросе есть ключевые слова
-    if model in web_search_supported_models and not use_web_search:
-        # Проверяем наличие ключевых слов для поиска в интернете
-        search_keywords = ['найди', 'поищи', 'search', 'найти', 'поиск', 'погугли', 'загугли']
-        content = messages[-1].get('content', '')
+                all_messages.append({"role": role, "content": content})
         
-        # Проверка типа контента и обработка соответствующим образом
-        if isinstance(content, list):
-            # Для мультимодального контента извлекаем текст
-            text_parts = []
-            for item in content:
-                if isinstance(item, dict) and 'text' in item:
-                    text_parts.append(item['text'])
-                elif isinstance(item, dict) and item.get('type') == 'text':
-                    text_parts.append(item.get('text', ''))
-            user_message = ' '.join(text_parts).lower()
-        else:
-            # Для обычного текстового контента
-            user_message = content.lower()
+        # Tool responses
+        elif role == 'tool':
+            tool_call_id = msg.get('tool_call_id')
+            name = msg.get('name')
+            content = msg.get('content')
             
-        if any(keyword in user_message for keyword in search_keywords):
-            use_web_search = True
-            logger.info(f"Automatically enabling web search for model {model} based on user message")
+            # Valid tool response
+            if tool_call_id and name and content:
+                all_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "name": name,
+                    "content": content
+                })
     
-    if use_web_search and model not in web_search_supported_models:
-        logger.warning(f"Model {model} does not support web search, ignoring web search parameter")
-        use_web_search = False
-    
-    # Prepare base payload
+    # Prepare 1minAI API request
     payload = {
-        "model": model,
         "promptObject": {
-            "prompt": all_messages,
-            "isMixed": False,
-            "webSearch": use_web_search
+            "conversation": all_messages,
+            "truncation": "AUTO"
+        },
+        "model": model,
+        "conversation": {
+            "uuid": str(uuid.uuid4())
         }
     }
     
@@ -1309,7 +1275,18 @@ def conversation():
     
     # Add tools if configured
     if tools_config:
-        payload["toolsConfig"] = tools_config
+        payload["toolsConfig"] = {
+            "tools": tools_config
+        }
+        
+        # Add tool_choice if specified
+        if tool_type_mentioned:
+            payload["toolsConfig"]["tool_choice"] = {
+                "type": "function",
+                "function": {"name": tool_type_mentioned}
+            }
+        
+        logger.debug(f"Adding tools configuration to payload: {json.dumps(payload['toolsConfig'])}")
     
     # Add additional parameters
     if 'temperature' in request_data:
@@ -1342,54 +1319,93 @@ def conversation():
         # Non-Streaming Response
         logger.debug("Non-Streaming AI Response")
         try:
+            # Логирование полного запроса для отладки
+            if has_tools_request:
+                tools_part = payload.get("toolsConfig", {})
+                logger.info(f"Sending request with tools for {tool_type_mentioned}: {json.dumps(tools_part)}")
+            
             response = requests.post(ONE_MIN_API_URL, json=payload, headers=headers)
             response.raise_for_status()
             one_min_response = response.json()
             
+            # Логирование ответа API и проверка наличия вызовов инструментов
+            if 'function_call' in one_min_response or 'tool_calls' in one_min_response:
+                logger.info("Response contains function/tool calls!")
+                if 'function_call' in one_min_response:
+                    logger.info(f"Function call: {json.dumps(one_min_response['function_call'])}")
+                if 'tool_calls' in one_min_response:
+                    logger.info(f"Tool calls: {json.dumps(one_min_response['tool_calls'])}")
+            elif has_tools_request:
+                logger.warning(f"Request mentioned {tool_type_mentioned} but response doesn't contain any tool calls")
+            
             transformed_response = transform_response(one_min_response, request_data, prompt_token)
             flask_response = make_response(jsonify(transformed_response))
-            set_response_headers(flask_response)
+            return set_response_headers(flask_response)
             
-            return flask_response, 200
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 401:
-                return ERROR_HANDLER(1020, key="[REDACTED]")
+        except requests.RequestException as e:
+            logger.error(f"Error with 1minAI API: {str(e)}")
             return ERROR_HANDLER(1500, detail=str(e))
-    
     else:
         # Streaming Response
         logger.debug("Streaming AI Response")
         try:
-            response_stream = requests.post(ONE_MIN_CONVERSATION_API_STREAMING_URL, 
-                                           data=json.dumps(payload), 
-                                           headers=headers, 
-                                           stream=True)
-            response_stream.raise_for_status()
-            
-            return Response(stream_response(response_stream, request_data, request_data.get('model', DEFAULT_MODEL), prompt_token), 
-                            mimetype='text/event-stream')
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 401:
-                return ERROR_HANDLER(1020, key="[REDACTED]")
-            
-            # If you get an error while streaming, try without streaming
-            logger.warning(f"Streaming request failed for model {model}, trying non-streaming mode")
-            try:
-                response = requests.post(ONE_MIN_API_URL, json=payload, headers=headers)
-                response.raise_for_status()
-                one_min_response = response.json()
+            # Логирование полного запроса для отладки
+            if has_tools_request:
+                tools_part = payload.get("toolsConfig", {})
+                logger.info(f"Sending streaming request with tools for {tool_type_mentioned}: {json.dumps(tools_part)}")
                 
-                transformed_response = transform_response(one_min_response, request_data, prompt_token)
-                flask_response = make_response(jsonify(transformed_response))
-                set_response_headers(flask_response)
+            def generate():
+                response = requests.post(ONE_MIN_CONVERSATION_API_STREAMING_URL, json=payload, headers=headers, stream=True)
                 
-                return flask_response, 200
-            except requests.exceptions.HTTPError as retry_e:
-                if retry_e.response.status_code == 401:
-                    return ERROR_HANDLER(1020, key="[REDACTED]")
-                return ERROR_HANDLER(1500, detail=str(retry_e))
+                if response.status_code != 200:
+                    logger.warning(f"Streaming request failed for model {model}, trying non-streaming mode")
+                    non_streaming_response = requests.post(ONE_MIN_API_URL, json=payload, headers=headers)
+                    non_streaming_response.raise_for_status()
+                    one_min_response = non_streaming_response.json()
+                    transformed_response = transform_response(one_min_response, request_data, prompt_token)
+                    
+                    # Формируем ответ как событие SSE
+                    yield f"data: {json.dumps(transformed_response)}\n\n"
+                    yield f"data: [DONE]\n\n"
+                    return
+                
+                # Обработка потокового ответа
+                for line in response.iter_lines():
+                    if line:
+                        line = line.decode('utf-8')
+                        if line.startswith('data: '):
+                            data = line[6:]  # Удаляем префикс "data: "
+                            if data == "[DONE]":
+                                yield f"data: [DONE]\n\n"
+                                break
+                            
+                            try:
+                                chunk = json.loads(data)
+                                # Проверяем наличие вызовов инструментов в потоковом ответе
+                                if 'function_call' in chunk or 'tool_calls' in chunk:
+                                    logger.info("Streaming response contains function/tool calls!")
+                                    if 'function_call' in chunk:
+                                        logger.info(f"Function call in stream: {json.dumps(chunk['function_call'])}")
+                                    if 'tool_calls' in chunk:
+                                        logger.info(f"Tool calls in stream: {json.dumps(chunk['tool_calls'])}")
+                                
+                                transformed_chunk = transform_streaming_response(chunk, request_data, model)
+                                yield f"data: {json.dumps(transformed_chunk)}\n\n"
+                            except json.JSONDecodeError as e:
+                                logger.error(f"Error parsing streaming response: {str(e)}")
+                                logger.error(f"Raw data: {data}")
+                                
+                # Проверка отсутствия вызовов инструментов в конце потока
+                if has_tools_request:
+                    logger.warning(f"Streaming request mentioned {tool_type_mentioned} but no tool calls were received in the stream")
             
+            return Response(generate(), mimetype='text/event-stream')
+            
+        except requests.RequestException as e:
+            logger.error(f"Error with 1minAI API streaming: {str(e)}")
+            return ERROR_HANDLER(1500, detail=str(e))
         except Exception as e:
+            logger.error(f"Error with 1minAI API streaming: {str(e)}")
             return ERROR_HANDLER(1500, detail=str(e))
 
 def transform_streaming_response(data, request_data, last_output, prompt_tokens):
@@ -1555,184 +1571,155 @@ def transform_streaming_response(data, request_data, last_output, prompt_tokens)
     transformed_response["choices"] = choices
     return transformed_response
 
-# Add a function to transform the response from 1minAI API into OpenAI API format
-def transform_response(one_min_response, request_data, prompt_tokens):
-    """Transform 1minAI response format to OpenAI format"""
-    current_time = int(time.time())
-    completion_id = f"chatcmpl-{uuid.uuid4()}"
-    model = map_model_to_openai(request_data.get('model', DEFAULT_MODEL))
-    
-    # Initialize transformed response
+def transform_response(response_data, request_data, prompt_token=0):
+    """
+    Transform 1minAI response to OpenAI format
+    """
     transformed_response = {
-        "id": completion_id,
+        "id": "chatcmpl-" + str(uuid.uuid4()),
         "object": "chat.completion",
-        "created": current_time,
-        "model": model,
-        "choices": [],
-        "usage": {}
-    }
-    
-    # Extract content from 1minAI response
-    content = one_min_response.get('content', '')
-    
-    # Handle tool calls if present
-    if 'function_call' in one_min_response or 'tool_calls' in one_min_response:
-        tool_calls = []
-        
-        # Convert old function_call format to new tool_calls
-        if 'function_call' in one_min_response:
-            tool_calls = [{
-                'name': one_min_response['function_call'].get('name', ''),
-                'arguments': one_min_response['function_call'].get('arguments', '{}'),
-                'id': f"call_{uuid.uuid4()}"
-            }]
-        else:
-            tool_calls = one_min_response.get('tool_calls', [])
-            for call in tool_calls:
-                if 'id' not in call:
-                    call['id'] = f"call_{uuid.uuid4()}"
-        
-        # Process each tool call
-        processed_calls = []
-        for tool_call in tool_calls:
-            function_name = tool_call.get('name', '')
-            function_args = tool_call.get('arguments', '{}')
-            call_id = tool_call.get('id')
-            
-            # Prepare arguments
-            try:
-                args = json.loads(function_args) if isinstance(function_args, str) else function_args
-            except json.JSONDecodeError:
-                logger.error(f"Invalid JSON in arguments for {function_name}: {function_args}")
-                args = {}
-            
-            # Process with appropriate handler
-            result = None
-            try:
-                if function_name == 'get_datetime':
-                    result = handle_get_datetime(args)
-                elif function_name == 'execute_python':
-                    # Улучшенная обработка execute_python
-                    logger.info(f"Executing Python code from tool call: {args.get('code', '')[:100]}...")
-                    
-                    # Если в телеграм-боте, логируем дополнительную информацию
-                    source = request_data.get('source', '')
-                    if source == 'telegram_bot':
-                        logger.info(f"Request from telegram bot - executing Python: {args.get('code', '')[:50]}...")
-                    
-                    result = handle_execute_python(args)
-                    
-                    # Логируем результат подробнее
-                    if result and isinstance(result, dict):
-                        status = result.get('status', 'unknown')
-                        output_len = len(result.get('output', ''))
-                        error = result.get('error', None)
-                        logger.info(f"Python execution result: status={status}, output_length={output_len}, error={'yes' if error else 'no'}")
-                    
-                elif function_name == 'web_search':
-                    # Улучшенная обработка web_search
-                    query = args.get('query', '')
-                    logger.info(f"Executing web search from tool call: query='{query}'")
-                    
-                    # Извлекаем API ключ
-                    api_key = extract_api_key()
-                    if not api_key:
-                        logger.warning("API key not found for web search, using default")
-                        api_key = None
-                    
-                    # Если в телеграм-боте, логируем дополнительную информацию
-                    source = request_data.get('source', '')
-                    if source == 'telegram_bot':
-                        logger.info(f"Request from telegram bot - searching for: {query}")
-                    
-                    # Выполняем поиск с явным вызовом web_search
-                    search_results = web_search(query, api_key)
-                    
-                    # Преобразуем в формат результата инструмента
-                    formatted_results = []
-                    for result_item in search_results.get('results', []):
-                        formatted_results.append({
-                            "title": result_item.get('title', ''),
-                            "url": result_item.get('url', ''),
-                            "snippet": result_item.get('snippet', ''),
-                            "date": result_item.get('date', '')
-                        })
-                    
-                    result = {
-                        "query": query,
-                        "results": formatted_results,
-                        "total_results": len(formatted_results)
-                    }
-                    
-                    # Логируем результат подробнее
-                    logger.info(f"Web search results: found {len(formatted_results)} results for query '{query}'")
-                    
-                else:
-                    logger.warning(f"Unknown function {function_name}")
-                    result = {"error": f"Unknown function {function_name}"}
-            except Exception as e:
-                logger.error(f"Error handling function {function_name}: {str(e)}")
-                result = {"error": str(e)}
-            
-            processed_calls.append({
-                "call": {
-                    "id": call_id,
-                    "type": "function",
-                    "function": {
-                        "name": function_name,
-                        "arguments": json.dumps(args)
-                    }
-                },
-                "result": result
-            })
-        
-        # Create response with tool calls
-        choice = {
+        "created": int(time.time()),
+        "model": request_data.get('model', DEFAULT_MODEL),
+        "choices": [{
             "index": 0,
             "message": {
                 "role": "assistant",
                 "content": None,
-                "tool_calls": [pc["call"] for pc in processed_calls]
-            },
-            "finish_reason": "tool_calls"
-        }
-        transformed_response["choices"].append(choice)
-        
-        # Add tool call results
-        for i, pc in enumerate(processed_calls):
-            if pc["result"]:
-                result_choice = {
-                    "index": i + 1,
-                    "message": {
-                        "role": "tool",
-                        "tool_call_id": pc["call"]["id"],
-                        "name": pc["call"]["function"]["name"],
-                        "content": json.dumps(pc["result"])
-                    },
-                    "finish_reason": "tool_result"
-                }
-                transformed_response["choices"].append(result_choice)
-    else:
-        # Regular text response
-        choice = {
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": content
             },
             "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": prompt_token,
+            "completion_tokens": 0,
+            "total_tokens": prompt_token
         }
-        transformed_response["choices"].append(choice)
-    
-    # Calculate completion tokens
-    completion_tokens = calculate_token(content, request_data.get('model', 'DEFAULT'))
-    
-    # Add usage information
-    transformed_response["usage"] = {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens
     }
+    
+    # Extract content from 1minAI response
+    if "choices" in response_data and len(response_data["choices"]) > 0:
+        if "message" in response_data["choices"][0]:
+            content = response_data["choices"][0]["message"].get("content")
+            transformed_response["choices"][0]["message"]["content"] = content
+    elif "content" in response_data:
+        content = response_data.get("content")
+        transformed_response["choices"][0]["message"]["content"] = content
+    
+    logger.debug(f"Response received, preparing transformation to OpenAI format")
+    
+    # Handle function/tool calls if present
+    tool_calls = []
+    
+    # Check for old function call format
+    if "function_call" in response_data:
+        logger.info(f"Old function call format detected: {json.dumps(response_data['function_call'])}")
+        # Convert old function call to new tool call
+        function_call = response_data["function_call"]
+        if "name" in function_call and "arguments" in function_call:
+            try:
+                # Try to parse the arguments as JSON
+                arguments = json.loads(function_call["arguments"])
+                logger.info(f"Function {function_call['name']} arguments parsed successfully")
+            except json.JSONDecodeError as e:
+                logger.error(f"Error parsing function arguments: {str(e)}")
+                # If parsing fails, use the raw string
+                arguments = function_call["arguments"]
+            
+            tool_call = {
+                "id": "call_" + str(uuid.uuid4()),
+                "type": "function",
+                "function": {
+                    "name": function_call["name"],
+                    "arguments": function_call["arguments"]
+                }
+            }
+            tool_calls.append(tool_call)
+            
+            logger.info(f"Converted function call to tool call: {json.dumps(tool_call)}")
+    
+    # Check for new tool calls format
+    if "tool_calls" in response_data:
+        logger.info(f"New tool calls format detected: {json.dumps(response_data['tool_calls'])}")
+        for tool_call in response_data["tool_calls"]:
+            if "function" in tool_call:
+                tool_calls.append(tool_call)
+    
+    # Process tool calls if present
+    if tool_calls:
+        processed_tool_calls = []
+        
+        for tool_call in tool_calls:
+            if "function" in tool_call:
+                function_name = tool_call["function"]["name"]
+                arguments_str = tool_call["function"]["arguments"]
+                
+                logger.info(f"Processing tool call for function: {function_name}")
+                
+                try:
+                    # Try to parse the arguments as JSON
+                    arguments = json.loads(arguments_str)
+                    logger.debug(f"Arguments parsed successfully: {json.dumps(arguments)}")
+                except json.JSONDecodeError as e:
+                    logger.error(f"Error parsing arguments: {str(e)}")
+                    # If parsing fails, use the raw string
+                    arguments = arguments_str
+                
+                # Execute the function call based on the function name
+                if function_name == "execute_python":
+                    logger.info(f"Executing Python code, length: {len(arguments.get('code', ''))}")
+                    start_time = time.time()
+                    try:
+                        result = execute_python_code(arguments.get("code", ""))
+                        execution_time = time.time() - start_time
+                        logger.info(f"Python execution completed in {execution_time:.2f}s, output length: {len(result)}")
+                    except Exception as e:
+                        logger.error(f"Error executing Python code: {str(e)}")
+                        result = f"Error: {str(e)}"
+                    
+                    tool_call["function"]["output"] = result
+                    processed_tool_calls.append(tool_call)
+                
+                elif function_name == "web_search":
+                    logger.info(f"Performing web search for query: {arguments.get('search_term', '')}")
+                    
+                    try:
+                        # Извлечение API ключа DuckDuckGo из переменных окружения
+                        ddg_api_key = os.environ.get("DUCKDUCKGO_API_KEY")
+                        if not ddg_api_key:
+                            logger.warning("DuckDuckGo API key not found in environment variables")
+                        
+                        start_time = time.time()
+                        search_results = web_search(arguments.get("search_term", ""))
+                        execution_time = time.time() - start_time
+                        
+                        logger.info(f"Web search completed in {execution_time:.2f}s, found {len(search_results)} results")
+                        
+                        # Преобразуем результаты в строку JSON для вывода
+                        result = json.dumps(search_results, ensure_ascii=False)
+                        
+                        tool_call["function"]["output"] = result
+                        processed_tool_calls.append(tool_call)
+                    except Exception as e:
+                        logger.error(f"Error performing web search: {str(e)}")
+                        tool_call["function"]["output"] = f"Error: {str(e)}"
+                        processed_tool_calls.append(tool_call)
+                
+                else:
+                    logger.warning(f"Unknown function: {function_name}")
+                    tool_call["function"]["output"] = f"Error: Unknown function {function_name}"
+                    processed_tool_calls.append(tool_call)
+        
+        # Add the processed tool calls to the response
+        if processed_tool_calls:
+            logger.info(f"Adding {len(processed_tool_calls)} processed tool calls to response")
+            transformed_response["choices"][0]["message"]["tool_calls"] = processed_tool_calls
+            transformed_response["choices"][0]["finish_reason"] = "tool_calls"
+    
+    # Handle usage information if available
+    if "usage" in response_data:
+        usage = response_data["usage"]
+        if "completion_tokens" in usage:
+            transformed_response["usage"]["completion_tokens"] = usage["completion_tokens"]
+            transformed_response["usage"]["total_tokens"] = prompt_token + usage["completion_tokens"]
     
     return transformed_response
 
@@ -2679,3 +2666,96 @@ if __name__ == "__main__":
     
     # Start the server
     app.run(host="0.0.0.0", port=PORT, debug=DEBUG_MODE)
+
+def process_user_input(messages):
+    """
+    Process the user input from messages, extracting text and images.
+    
+    Args:
+        messages (list): List of message objects
+        
+    Returns:
+        tuple: (user_input, image_paths, has_image)
+    """
+    user_input = ""
+    image_paths = []
+    has_image = False
+    
+    # Check for empty messages
+    if not messages:
+        logger.warning("No messages provided")
+        return "", [], False
+    
+    # Get the last user message
+    last_user_message = None
+    for msg in reversed(messages):
+        if msg.get('role') == 'user':
+            last_user_message = msg
+            break
+    
+    if not last_user_message:
+        logger.warning("No user message found")
+        return "", [], False
+    
+    # Extract content from the last user message
+    content = last_user_message.get('content', '')
+    
+    # Handle multimodal content
+    if isinstance(content, list):
+        # Content is a list of objects
+        text_parts = []
+        
+        for item in content:
+            item_type = item.get('type')
+            
+            if item_type == 'text':
+                text_parts.append(item.get('text', ''))
+            elif item_type == 'image_url':
+                # Process image URL
+                image_url = item.get('image_url', {}).get('url', '')
+                if image_url.startswith('data:'):
+                    # Base64 encoded image
+                    try:
+                        # Extract content type and base64 data
+                        parts = image_url.split(',', 1)
+                        if len(parts) == 2:
+                            content_type = parts[0].split(';')[0].split(':')[1]
+                            base64_data = parts[1]
+                            
+                            # Determine file extension
+                            ext = 'jpg'  # Default
+                            if 'png' in content_type:
+                                ext = 'png'
+                            elif 'webp' in content_type:
+                                ext = 'webp'
+                            elif 'gif' in content_type:
+                                ext = 'gif'
+                            
+                            # Save image to temp file
+                            import base64
+                            import tempfile
+                            import os
+                            
+                            temp_dir = tempfile.gettempdir()
+                            temp_file = os.path.join(temp_dir, f"image_{uuid.uuid4()}.{ext}")
+                            
+                            with open(temp_file, 'wb') as f:
+                                f.write(base64.b64decode(base64_data))
+                            
+                            image_paths.append(temp_file)
+                            has_image = True
+                            logger.debug(f"Saved image to {temp_file}")
+                        else:
+                            logger.error("Invalid data URL format")
+                    except Exception as e:
+                        logger.error(f"Error processing base64 image: {str(e)}")
+                else:
+                    # URL to image - not supported in this implementation
+                    logger.warning(f"External image URLs not supported: {image_url[:30]}...")
+        
+        user_input = "\n".join(text_parts)
+    else:
+        # Content is a string
+        user_input = content
+    
+    return user_input, image_paths, has_image
