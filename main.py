@@ -1023,6 +1023,17 @@ def process_stt_request():
         traceback.print_exc()
         return jsonify({"error": f"Error processing audio transcription: {str(e)}"}), 500
 
+@app.route('/v1/audio/transcriptions', methods=['POST', 'OPTIONS'])
+@limiter.limit("500 per minute")
+def audio_transcriptions():
+    """Endpoint для транскрипции аудио в текст с использованием модели Whisper-1.
+    Также поддерживает перенаправление текста на выбранную модель для генерации ответа.
+    """
+    if request.method == 'OPTIONS':
+        return handle_options_request()
+    
+    return process_stt_request()
+        
 @app.route('/v1/audio/speech', methods=['POST', 'OPTIONS'])
 @limiter.limit("500 per minute")
 def audio_speech():
