@@ -1378,17 +1378,29 @@ def conversation():
         })
     
     # Convert to JSON string for 1minAI API
-    conversation_str = json.dumps(processed_messages)
+    # Только последнее сообщение пользователя будет отправлено в API
+    user_messages = [msg for msg in processed_messages if msg["role"] == "user"]
+    if user_messages:
+        last_user_message = user_messages[-1]["content"]
+    else:
+        last_user_message = "Привет"  # Дефолтное сообщение, если не найдено сообщение пользователя
     
     payload = {
         "type": "CHAT_WITH_AI",
         "model": model,
         "promptObject": {
-            "prompt": conversation_str,
+            "prompt": last_user_message,
             "isMixed": False,
             "webSearch": False
         }
     }
+    
+    # Добавляем webSearch: true если используется инструмент web_search
+    if any(tool.get("name") == "get_search_results" for tool in tools_config):
+        payload["promptObject"]["webSearch"] = True
+        payload["promptObject"]["numOfSite"] = 3
+        payload["promptObject"]["maxWord"] = 1000
+        logger.debug("Enabling web search in the request")
     
     # Set request type based on content
     if has_image:
