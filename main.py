@@ -1021,11 +1021,43 @@ def process_stt_request():
                     response_data = response.json()
                     logger.debug(f"Received non-streaming response: {json.dumps(response_data)[:200]}...")
                     
-                    # Get the content from the response
-                    content = response_data.get('content', '')
+                    # Извлекаем контент из ответа - ищем его в разных местах JSON, аналогично тому, 
+                    # как мы делаем для транскрипции
+                    content = ""
+                    
+                    # Сначала ищем прямое поле content в корне ответа
+                    if "content" in response_data:
+                        content = response_data.get('content', '')
+                    
+                    # Если контента нет, ищем в aiRecord
+                    if not content and "aiRecord" in response_data:
+                        ai_record = response_data["aiRecord"]
+                        
+                        # Проверяем наличие aiRecordDetail
+                        if "aiRecordDetail" in ai_record:
+                            details = ai_record["aiRecordDetail"]
+                            
+                            # Ищем в resultObject
+                            if "resultObject" in details:
+                                result_obj = details["resultObject"]
+                                if isinstance(result_obj, list) and result_obj:
+                                    # Объединяем все строки из массива
+                                    content = "".join(result_obj)
+                                elif isinstance(result_obj, str):
+                                    content = result_obj
+                                elif isinstance(result_obj, dict):
+                                    # Если это словарь, ищем в нем текстовые поля
+                                    for field in ["text", "content", "message", "response"]:
+                                        if field in result_obj and result_obj[field]:
+                                            content = result_obj[field]
+                                            break
+                    
+                    # Если все еще не нашли контент, используем дефолтное сообщение
                     if not content:
                         logger.warning(f"Empty content in response: {json.dumps(response_data)[:200]}...")
                         content = "Я не смог обработать ваш запрос. Пожалуйста, попробуйте еще раз."
+                    
+                    logger.info(f"Extracted content from response: {content[:100]}...")
                     
                     # Create completion response
                     completion_id = f"chatcmpl-{uuid.uuid4()}"
