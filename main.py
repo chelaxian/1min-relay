@@ -144,31 +144,22 @@ ALL_ONE_MIN_AVAILABLE_MODELS = [
     "mistral-small-latest",
     "mistral-nemo",
     "open-mistral-7b",
-
     # STT
     #"whisper-1", 
-
     # TTS
-    #"alloy", 
-    
-   # Replicate
-   "meta/llama-2-70b-chat", 
-   "meta/meta-llama-3-70b-instruct", 
-   "meta/meta-llama-3.1-405b-instruct", 
-   "command"
+    #"alloy",   
+    # Replicate
+    "meta/llama-2-70b-chat", 
+    "meta/meta-llama-3-70b-instruct", 
+    "meta/meta-llama-3.1-405b-instruct", 
+    "command"
 ]
 
 # Define the models that support vision inputs
 vision_supported_models = [
     "gpt-4o",
     "gpt-4o-mini",
-    "gpt-4-turbo"#,
-    #"claude-3-5-sonnet-20240620",
-    #"claude-3-opus-20240229",
-    #"claude-3-sonnet-20240229",
-    #"claude-3-haiku-20240307",
-    #"gemini-1.5-pro",
-    #"gemini-1.5-flash"
+    "gpt-4-turbo"
 ]
 
 # Define models that support tool use (function calling)
@@ -185,11 +176,11 @@ tools_supported_models = [
 
 # Define models that support text-to-speech
 tts_supported_models = [
-#     "alloy"
+     "alloy"
 ]
 
 stt_supported_models = [
-#     "whisper-1"
+     "whisper-1"
 ]
 
 # Define models that support web search
@@ -228,7 +219,7 @@ AVAILABLE_MODELS = []
 AVAILABLE_MODELS.extend(SUBSET_OF_ONE_MIN_PERMITTED_MODELS)
 
 # Default model to use
-DEFAULT_MODEL = "mistral-nemo"
+DEFAULT_MODEL = "gpt-4o-mini"
 
 def map_model_to_openai(model):
     """Map 1minAI model name to OpenAI compatible model name"""
@@ -318,7 +309,14 @@ def models():
     #     for model_name in tts_supported_models
     # ]
     # models_data.extend(tts_models_data)
-    
+ 
+    # Add STT models
+    # stt_models_data = [
+    #     {"id": model_name, "object": "model", "owned_by": "1minai", "created": 1727389042}
+    #     for model_name in stt_supported_models
+    # ]
+    # models_data.extend(stt_models_data)
+ 
     return jsonify({"data": models_data, "object": "list"})
 
 def format_conversation_history(messages, new_input, system_prompt=None):
@@ -749,8 +747,8 @@ def process_tts_request(request_data):
     if not input_text:
         return ERROR_HANDLER(1412, detail="No input text provided for TTS")
     
-    # if model not in tts_supported_models:
-    #     return ERROR_HANDLER(1046, model=model)
+    if model not in tts_supported_models:
+        return ERROR_HANDLER(1046, model=model)
     
     # Prepare request to 1minAI API using unified endpoint
     headers = {
@@ -817,6 +815,9 @@ def process_stt_request():
     if 'file' not in request.files:
         logger.error("No audio file in request")
         return ERROR_HANDLER(1700, detail="No audio file provided")
+
+    if model not in stt_supported_models:
+        return ERROR_HANDLER(1046, model=model)
     
     audio_file = request.files['file']
     
@@ -1038,6 +1039,7 @@ def process_stt_request():
         traceback.print_exc()
         return jsonify({"error": f"Error processing audio transcription: {str(e)}"}), 500
 
+
 @app.route('/v1/audio/transcriptions', methods=['POST', 'OPTIONS'])
 @limiter.limit("500 per minute")
 def audio_transcriptions():
@@ -1048,6 +1050,7 @@ def audio_transcriptions():
         return handle_options_request()
     
     return process_stt_request()
+
         
 @app.route('/v1/audio/speech', methods=['POST', 'OPTIONS'])
 @limiter.limit("500 per minute")
@@ -1058,6 +1061,7 @@ def audio_speech():
     return process_tts_request(request_data)    
     # Temporarily return an error that the function is disabled
     # return ERROR_HANDLER(1600, detail="TTS functionality is temporarily disabled")
+
 
 @app.route('/v1/chat/completions', methods=['POST', 'OPTIONS'])
 @limiter.limit("500 per minute")
@@ -1080,11 +1084,15 @@ def conversation():
     }
     
     # Get model
-    model = request_data.get('model', 'mistral-nemo')
+    model = request_data.get('model', 'gpt-4o-mini')
     
     # Check to see if the TTS model is a model
     if model in tts_supported_models:
         return ERROR_HANDLER(1600, detail="TTS models can only be used with the /v1/audio/speech endpoint")
+
+    # Check to see if the STT model is a model
+    if model in stt_supported_models:
+        return ERROR_HANDLER(1600, detail="STT models can only be used with the /v1/audio/transcriptions endpoint")
     
     if PERMIT_MODELS_FROM_SUBSET_ONLY and model not in AVAILABLE_MODELS:
         return ERROR_HANDLER(1002, model)
@@ -1192,7 +1200,7 @@ def conversation():
     # Автоматически включаем веб-поиск для поддерживаемых моделей, если в запросе есть ключевые слова
     if model in web_search_supported_models and not use_web_search:
         # Проверяем наличие ключевых слов для поиска в интернете
-        search_keywords = ['найди', 'поищи', 'search', 'найти', 'поиск', 'погугли', 'загугли']
+        search_keywords = ['найди', 'поищи', 'search', 'найти', 'поиск', 'погугли', 'загугли', 'ищи', 'интернете', 'internet', 'интернета', 'искать', 'интернет', 'интернетом', 'google', 'browse', 'find', 'узнай', 'почитай', 'прочитай', 'уточни', 'проверь', 'check', 'онлайн', 'online', 'confirm']
         content = messages[-1].get('content', '')
         
         # Проверка типа контента и обработка соответствующим образом
@@ -1223,8 +1231,11 @@ def conversation():
         "promptObject": {
             "prompt": all_messages,
             "isMixed": False,
-            "webSearch": use_web_search
-        }
+            "webSearch": use_web_search #,
+            #"webSearch": true,
+        		#"numOfSite": 1,
+        		#"maxWord": 500 
+ }
     }
     
     # Set request type based on content
@@ -1639,16 +1650,6 @@ def transform_response(one_min_response, request_data, prompt_tokens):
     
     return transformed_response
 
-@app.route('/v1/embeddings', methods=['POST', 'OPTIONS'])
-@limiter.limit("500 per minute")
-def embeddings():
-    """Handle embeddings API requests"""
-    if request.method == 'OPTIONS':
-        return handle_options_request()
-    
-    # В официальной документации 1min.ai тип EMBEDDINGS не подтвержден
-    return ERROR_HANDLER(1500, detail="Embeddings API is not supported by 1min.ai")
-
 @app.route('/v1/images/generations', methods=['POST', 'OPTIONS'])
 @limiter.limit("500 per minute")
 def images_generations():
@@ -1721,35 +1722,6 @@ def images_generations():
     except Exception as e:
         return ERROR_HANDLER(1500, detail=str(e))
 
-@app.route('/v1/moderations', methods=['POST', 'OPTIONS'])
-@limiter.limit("500 per minute")
-def moderations():
-    """Handle moderation API requests"""
-    if request.method == 'OPTIONS':
-        return handle_options_request()
-    
-    # В официальной документации 1min.ai тип MODERATION не подтвержден
-    return ERROR_HANDLER(1500, detail="Moderations API is not supported by 1min.ai")
-
-@app.route('/v1/assistants', methods=['GET', 'POST', 'OPTIONS'])
-@limiter.limit("500 per minute")
-def assistants():
-    """Handle assistants API requests"""
-    if request.method == 'OPTIONS':
-        return handle_options_request()
-    
-    # В официальной документации 1min.ai тип ASSISTANT_CREATE не подтвержден
-    return ERROR_HANDLER(1500, detail="Assistants API is not supported by 1min.ai")
-
-@app.route('/v1/files', methods=['GET', 'POST', 'OPTIONS'])
-@limiter.limit("500 per minute")
-def files():
-    """Handle file upload and retrieval"""
-    if request.method == 'OPTIONS':
-        return handle_options_request()
-    
-    # В официальной документации 1min.ai тип FILES_LIST не подтвержден
-    return ERROR_HANDLER(1500, detail="Files API is not supported by 1min.ai")
 
 def upload_file_to_1min(file_data, file_name, mime_type, api_key):
     """
@@ -1824,7 +1796,7 @@ def execute_python_code(code, timeout=10):
         }
         
         # Add some safe modules
-        for module_name in ['math', 'random', 'datetime', 're', 'json', 'collections']:
+        for module_name in ['math', 'random', 'datetime', 're', 'json', 'collections', 'mpmath']:
             try:
                 safe_globals[module_name] = __import__(module_name)
             except ImportError:
