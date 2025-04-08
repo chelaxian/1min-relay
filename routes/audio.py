@@ -12,7 +12,8 @@ from utils.common import (
     create_session, 
     api_request, 
     safe_temp_file, 
-    calculate_token
+    calculate_token,
+    calculate_audio_cost
 )
 from utils.memcached import safe_memcached_operation
 from routes.functions.shared_func import validate_auth, handle_api_error, extract_text_from_response, extract_audio_url
@@ -50,6 +51,50 @@ def audio_transcriptions():
     logger.info(f"[{request_id}] Processing audio transcription with model {model}")
 
     try:
+        # Определяем длительность аудио файла, если возможно
+        duration_seconds = None
+        try:
+            # Сохраняем файл временно для определения длительности
+            temp_path = safe_temp_file("audio", request_id)
+            audio_file.save(temp_path)
+            
+            # Пробуем определить длительность через ffprobe (если доступен)
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ['ffprobe', '-i', temp_path, '-show_entries', 'format=duration', '-v', 'quiet', '-of', 'csv=p=0'], 
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+                if result.returncode == 0:
+                    duration_seconds = float(result.stdout.decode('utf-8').strip())
+                    logger.debug(f"[{request_id}] Audio duration: {duration_seconds} seconds")
+            except Exception as e:
+                logger.warning(f"[{request_id}] Failed to determine audio duration: {str(e)}")
+                
+            # Устанавливаем аудиофайл обратно в начало для последующего использования
+            audio_file.stream.seek(0)
+            
+            # Если не удалось определить через ffprobe, используем примерную оценку по размеру
+            if duration_seconds is None:
+                # Примерно: 1 МБ MP3 = 1 минута аудио (очень грубая оценка)
+                file_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
+                duration_seconds = file_size_mb * 60
+                logger.debug(f"[{request_id}] Estimated audio duration from size: ~{duration_seconds} seconds")
+            
+            # Удаляем временный файл
+            try:
+                os.remove(temp_path)
+            except:
+                pass
+                
+        except Exception as e:
+            logger.warning(f"[{request_id}] Could not determine audio duration: {str(e)}")
+            
+        # Рассчитываем примерную стоимость операции
+        cost = calculate_audio_cost(model, duration_seconds=duration_seconds)
+        logger.info(f"[{request_id}] Estimated STT cost: {cost} units for audio of ~{duration_seconds:.1f} seconds with '{model}'")
+        
         # Загружаем аудио файл
         audio_path, error = upload_audio_file(audio_file, api_key, request_id)
         if error:
@@ -110,7 +155,9 @@ def audio_transcriptions():
             logger.error(f"[{request_id}] Could not extract transcription text from API response")
             return jsonify({"error": "Could not extract transcription text"}), 500
         
-        logger.info(f"[{request_id}] Successfully processed audio transcription")
+        # Подсчитываем токены в результате
+        token_count = calculate_token(result_text, "gpt-4")
+        logger.info(f"[{request_id}] Successfully processed audio transcription: ~{token_count} tokens in result")
         
         # Создаем json строго в формате Openai API
         response_data = {"text": result_text}
@@ -275,6 +322,11 @@ def text_to_speech():
         return jsonify({"error": "No input text provided"}), 400
 
     try:
+        # Рассчитываем примерную стоимость операции
+        token_count = calculate_token(input_text, model)
+        cost = calculate_audio_cost(model, text=input_text)
+        logger.info(f"[{request_id}] Estimated TTS cost: {cost} units, ~{token_count} tokens for '{model}'")
+        
         # Используем функцию prepare_tts_payload для формирования запроса
         payload = prepare_tts_payload(model, input_text, voice, speed, response_format)
         
