@@ -1,4 +1,4 @@
-# version 1.0.1 #increment every time you make changes
+# version 1.0.2 #increment every time you make changes
 # Маршруты для текстовых моделей
 # Импортируем только необходимые модули
 from utils.imports import *
@@ -709,7 +709,10 @@ def conversation():
                     full_audio_url = f"https://asset.1min.ai/{audio_url}"
                     logger.warning(f"[{request_id}] Error occurred, using fallback URL: {full_audio_url}")
                 
-                # We form a response in the format similar to Chat Complets
+                # Подсчет токенов для TTS
+                prompt_tokens = calculate_token(prompt_text, model)
+                
+                # Формируем ответ для TTS с добавлением поля usage
                 completion_response = {
                     "id": f"chatcmpl-{request_id}",
                     "object": "chat.completion",
@@ -726,9 +729,9 @@ def conversation():
                         }
                     ],
                     "usage": {
-                        "prompt_tokens": len(prompt_text.split()),
+                        "prompt_tokens": prompt_tokens,
                         "completion_tokens": 1,
-                        "total_tokens": len(prompt_text.split()) + 1
+                        "total_tokens": prompt_tokens + 1
                     }
                 }
                 
@@ -1113,6 +1116,25 @@ def conversation():
                     openai_response = format_openai_response(
                         ai_response, model, request_id
                     )
+
+                    # Добавляем расчет использованных токенов в ответ
+                    if "choices" in openai_response and openai_response["choices"]:
+                        completion_text = ""
+                        for choice in openai_response["choices"]:
+                            if "message" in choice and "content" in choice["message"]:
+                                completion_text += choice["message"]["content"]
+                        
+                        # Получаем количество токенов в ответе
+                        completion_tokens = calculate_token(completion_text, model)
+                        
+                        # Если в ответе нет поля usage, добавляем его
+                        if "usage" not in openai_response:
+                            openai_response["usage"] = {
+                                "prompt_tokens": calculate_token(prompt_text, model),
+                                "completion_tokens": completion_tokens,
+                                "total_tokens": calculate_token(prompt_text, model) + completion_tokens
+                            }
+                    
                     return jsonify(openai_response)
                 except Exception as e:
                     logger.error(
@@ -1122,7 +1144,7 @@ def conversation():
                     return jsonify({"error": str(e)}), 500
 
         # Counting tokens
-        prompt_token = calculate_token(str(all_messages))
+        prompt_token = calculate_token(str(all_messages), model)
 
         # Checking the model
         if PERMIT_MODELS_FROM_SUBSET_ONLY and model not in AVAILABLE_MODELS:
@@ -1230,6 +1252,24 @@ def conversation():
                     one_min_response, request_data, prompt_token
                 )
 
+                # Добавляем расчет использованных токенов в ответ
+                if "choices" in transformed_response and transformed_response["choices"]:
+                    completion_text = ""
+                    for choice in transformed_response["choices"]:
+                        if "message" in choice and "content" in choice["message"]:
+                            completion_text += choice["message"]["content"]
+                    
+                    # Получаем количество токенов в ответе
+                    completion_tokens = calculate_token(completion_text, model)
+                    
+                    # Если в ответе нет поля usage, добавляем его
+                    if "usage" not in transformed_response:
+                        transformed_response["usage"] = {
+                            "prompt_tokens": prompt_token,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": prompt_token + completion_tokens
+                        }
+                
                 response = make_response(jsonify(transformed_response))
                 set_response_headers(response)
                 return response, 200
