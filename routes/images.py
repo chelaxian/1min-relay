@@ -1,4 +1,4 @@
-# version 1.0.1 #increment every time you make changes
+# version 1.0.5 #increment every time you make changes
 # routes/images.py
 
 # Импортируем только необходимые модули
@@ -177,7 +177,13 @@ def generate_image():
                 },
                 "index": 0,
                 "finish_reason": "stop"
-            }]
+            }],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": 0,
+                "total_tokens": prompt_tokens,
+                "cost": cost
+            }
         }
         response_obj = make_response(jsonify(openai_response))
         set_response_headers(response_obj)
@@ -499,7 +505,11 @@ def image_variations():
         image_lines = [f"![Variation {i+1}]({data['full_url']}) `[_V{i+1}_]`" for i, data in enumerate(full_variation_urls)]
         markdown_text = "\n".join(image_lines)
         markdown_text += "\n\n> To generate **variants** of an **image** - tap (copy) **[_V1_]** - **[_V4_]** and send it (paste) in the next **prompt**"
-
+    # Рассчитываем примерную стоимость операции для вариаций
+    cost = calculate_image_cost(current_model, mode=mode)
+    logger.info(f"[{request_id}] Estimated image variation cost: {cost} units, model: {current_model}, mode: {mode or 'default'}")
+    
+    # Формируем ответ в формате OpenAI API
     openai_response = {
         "created": int(time.time()),
         "data": openai_data,
@@ -510,8 +520,15 @@ def image_variations():
             },
             "index": 0,
             "finish_reason": "stop"
-        }]
+        }],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cost": cost
+        }
     }
+    
     session.close()
-    logger.info(f"[{request_id}] Successfully generated {len(openai_data)} image variations using model {current_model}")
+    logger.info(f"[{request_id}] Successfully created {len(openai_data)} image variations using model {current_model}")
     return jsonify(openai_response), 200
