@@ -1,4 +1,4 @@
-# version 1.0.1 #increment every time you make changes
+# version 1.0.4 #increment every time you make changes
 # routes/functions/img_func.py 
 
 from utils.imports import *
@@ -32,7 +32,7 @@ def build_generation_payload(model, prompt, request_data, negative_prompt, aspec
     payload = {}
     if model == "dall-e-3":
         # Проверяем, входит ли размер в список разрешенных для DALL-E 3
-        gen_size = size or request_data.get("size", "1024x1024")
+        gen_size = size or request_data.get("size", DALLE3_SIZES[0])
         if gen_size not in DALLE3_SIZES:
             logger.warning(f"[{request_id}] Размер {gen_size} не входит в список разрешенных для DALL-E 3. Используем {DALLE3_SIZES[0]}")
             gen_size = DALLE3_SIZES[0]
@@ -50,7 +50,7 @@ def build_generation_payload(model, prompt, request_data, negative_prompt, aspec
         }
     elif model == "dall-e-2":
         # Проверяем, входит ли размер в список разрешенных для DALL-E 2
-        gen_size = size or request_data.get("size", "1024x1024")
+        gen_size = size or request_data.get("size", DALLE2_SIZES[0])
         if gen_size not in DALLE2_SIZES:
             logger.warning(f"[{request_id}] Размер {gen_size} не входит в список разрешенных для DALL-E 2. Используем {DALLE2_SIZES[0]}")
             gen_size = DALLE2_SIZES[0]
@@ -84,6 +84,12 @@ def build_generation_payload(model, prompt, request_data, negative_prompt, aspec
             ar_parts = tuple(map(int, aspect_ratio.split(":"))) if aspect_ratio else (1, 1)
         except Exception:
             ar_parts = (1, 1)
+        
+        # Проверяем, входит ли соотношение сторон в разрешенные для Midjourney
+        if aspect_ratio and aspect_ratio not in MIDJOURNEY_ALLOWED_ASPECT_RATIOS:
+            logger.warning(f"[{request_id}] Соотношение сторон {aspect_ratio} не входит в список разрешенных для Midjourney. Используем 1:1")
+            ar_parts = (1, 1)
+            
         model_name = "midjourney" if model == "midjourney" else "midjourney_6_1"
         payload = {
             "type": "IMAGE_GENERATOR",
@@ -113,6 +119,12 @@ def build_generation_payload(model, prompt, request_data, negative_prompt, aspec
         if not model.startswith("black-forest-labs/"):
             model_name = f"black-forest-labs/{model}"
             logger.debug(f"[{request_id}] Добавлен префикс к модели Flux: {model_name}")
+        
+        # Проверяем, входит ли соотношение сторон в разрешенные для Flux
+        flux_aspect_ratio = aspect_ratio or request_data.get("aspect_ratio", "1:1")
+        if flux_aspect_ratio not in FLUX_ALLOWED_ASPECT_RATIOS:
+            logger.warning(f"[{request_id}] Соотношение сторон {flux_aspect_ratio} не входит в список разрешенных для Flux. Используем 1:1")
+            flux_aspect_ratio = "1:1"
             
         payload = {
             "type": "IMAGE_GENERATOR",
@@ -120,7 +132,7 @@ def build_generation_payload(model, prompt, request_data, negative_prompt, aspec
             "promptObject": {
                 "prompt": prompt,
                 "num_outputs": request_data.get("n", 1),
-                "aspect_ratio": aspect_ratio or request_data.get("aspect_ratio", "1:1"),
+                "aspect_ratio": flux_aspect_ratio,
                 "output_format": request_data.get("output_format", "webp"),
             },
         }
@@ -133,6 +145,22 @@ def build_generation_payload(model, prompt, request_data, negative_prompt, aspec
         "aa77f04e-3eec-4034-9c07-d0f619684628", "kino-xl",
         "2067ae52-33fd-4a82-bb92-c2c55e7d2786", "albedo-base-xl"
     ]:
+        # Проверяем, входит ли соотношение сторон в разрешенные для Leonardo
+        if aspect_ratio and aspect_ratio not in LEONARDO_ALLOWED_ASPECT_RATIOS:
+            logger.warning(f"[{request_id}] Соотношение сторон {aspect_ratio} не входит в список разрешенных для Leonardo. Используем ближайшее.")
+            # Преобразуем к ближайшему допустимому соотношению сторон
+            width, height = map(int, aspect_ratio.split(':'))
+            ratio = width / height
+            if abs(ratio - 1) < 0.1:
+                aspect_ratio = "1:1"
+                size = LEONARDO_SIZES["1:1"]
+            elif ratio > 1:
+                aspect_ratio = "4:3"
+                size = LEONARDO_SIZES["4:3"]
+            else:
+                aspect_ratio = "3:4"
+                size = LEONARDO_SIZES["3:4"]
+        
         payload = {
             "type": "IMAGE_GENERATOR",
             "model": model,
@@ -148,9 +176,8 @@ def build_generation_payload(model, prompt, request_data, negative_prompt, aspec
             del payload["promptObject"]["negativePrompt"]
         if model == "e71a1c2f-4f80-4800-934f-2c68979d8cc8":
             payload["promptObject"]["size"] = size or request_data.get("size", "1024x1024")
-            payload["promptObject"]["aspect_ratio"] = aspect_ratio
-            if not payload["promptObject"]["aspect_ratio"]:
-                del payload["promptObject"]["aspect_ratio"]
+            if aspect_ratio:
+                payload["promptObject"]["aspect_ratio"] = aspect_ratio
     else:
         logger.error(f"[{request_id}] Invalid model: {model}")
         return None, ERROR_HANDLER(1002, model)
@@ -273,6 +300,15 @@ def parse_aspect_ratio(prompt, model, request_data, request_id=None):
                 size = "1024x1792"
                 aspect_ratio = "portrait"
             logger.debug(f"[{request_id}] Adjusted size for DALL-E 3: {size}, aspect_ratio: {aspect_ratio}")
+            
+        # Проверяем, входит ли размер в список разрешенных для DALL-E 2 и DALL-E 3
+        if model == "dall-e-2" and size not in DALLE2_SIZES:
+            logger.warning(f"[{request_id}] Размер {size} не поддерживается для DALL-E 2. Используем {DALLE2_SIZES[0]}")
+            size = DALLE2_SIZES[0]
+        elif model == "dall-e-3" and size not in DALLE3_SIZES:
+            logger.warning(f"[{request_id}] Размер {size} не поддерживается для DALL-E 3. Используем {DALLE3_SIZES[0]}")
+            size = DALLE3_SIZES[0]
+            
         # Special adjustments for Leonardo models
         elif model in [
             "6b645e3a-d64f-4341-a6d8-7a3690fbf042", "phoenix",
@@ -283,12 +319,8 @@ def parse_aspect_ratio(prompt, model, request_data, request_id=None):
             "aa77f04e-3eec-4034-9c07-d0f619684628", "kino-xl",
             "2067ae52-33fd-4a82-bb92-c2c55e7d2786", "albedo-base-xl"
         ] and aspect_ratio:
-            if aspect_ratio == "1:1":
-                size = LEONARDO_SIZES["1:1"]
-            elif aspect_ratio == "4:3":
-                size = LEONARDO_SIZES["4:3"]
-            elif aspect_ratio == "3:4":
-                size = LEONARDO_SIZES["3:4"]
+            if aspect_ratio in LEONARDO_SIZES:
+                size = LEONARDO_SIZES[aspect_ratio]
             else:
                 width, height = map(int, aspect_ratio.split(':'))
                 ratio = width / height
