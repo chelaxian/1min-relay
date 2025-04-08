@@ -1,4 +1,4 @@
-# version 1.0.3 #increment every time you make changes
+# version 1.0.5 #increment every time you make changes
 # utils/constants.py
 # Файл констант для приложения
 
@@ -51,6 +51,67 @@ DEFAULT_THREADS = 6  # Количество потоков по умолчани
 # Настройки для моделей
 SUBSET_OF_ONE_MIN_PERMITTED_MODELS = ["mistral-nemo", "gpt-4o-mini", "o3-mini", "deepseek-chat"]
 PERMIT_MODELS_FROM_SUBSET_ONLY = False
+
+# Permissible parties for different models
+MIDJOURNEY_ALLOWED_ASPECT_RATIOS = [
+    "1:1",      # Square
+    "16:9",     # Widescreen format
+    "9:16",     # Vertical variant of 16:9
+    "16:10",    # Alternative widescreen
+    "10:16",    # Vertical variant of 16:10
+    "8:5",      # Alternative widescreen
+    "5:8",      # Vertical variant of 16:10
+    "3:4",      # Portrait/print
+    "4:3",      # Standard TV/monitor format
+    "3:2",      # Popular in photography
+    "2:3",      # Inverse of 3:2
+    "4:5",      # Common in social media posts
+    "5:4",      # Nearly square format
+    "137:100",  # Academy ratio (1.37:1) as an integer ratio
+    "166:100",  # European cinema (1.66:1) as an integer ratio
+    "185:100",  # Cinematic format (1.85:1) as an integer ratio185
+    "83:50",    # European cinema (1.66:1) as an integer ratio
+    "37:20",    # Cinematic format (1.85:1) as an integer ratio
+    "2:1",      # Maximum allowed widescreen format
+    "1:2"       # Maximum allowed vertical format
+]
+
+FLUX_ALLOWED_ASPECT_RATIOS = ["1:1", "16:9", "9:16", "3:2", "2:3", "3:4", "4:3", "4:5", "5:4"]
+LEONARDO_ALLOWED_ASPECT_RATIOS = ["1:1", "4:3", "3:4"]
+
+# Permissible sizes for different models
+DALLE2_SIZES = ["1024x1024", "512x512", "256x256"]
+DALLE3_SIZES = ["1024x1024", "1024x1792", "1792x1024"]
+LEONARDO_SIZES = ALBEDO_SIZES = {"1:1": "1024x1024", "4:3": "1024x768", "3:4": "768x1024"}
+
+# Цены на генерацию изображений (в условных единицах)
+IMAGE_GENERATION_PRICES = {
+    "dall-e-3": 120000,
+    "dall-e-2": 60000,
+    "stable-diffusion-xl-1024-v1-0": 18000,
+    "stable-diffusion-v1-6": 30000,
+    "midjourney": {"relax": 60000, "fast": 120000},
+    "midjourney_6_1": {"relax": 60000, "fast": 120000},
+    "phoenix": 140400,
+    "lightning-xl": 140400,
+    "anime-xl": 140400,
+    "diffusion-xl": 140400,
+    "kino-xl": 140400,
+    "vision-xl": 140400,
+    "albedo-base-xl": 140400,
+    "flux-schnell": 9000,
+    "flux-dev": 90000,
+    "flux-pro": 165000,
+    "flux-1.1-pro": 120000
+}
+
+# Цены на вариации изображений (в условных единицах)
+IMAGE_VARIATION_PRICES = {
+    "midjourney": {"relax": 90000, "fast": 150000},
+    "midjourney_6_1": {"relax": 90000, "fast": 150000},
+    "dall-e-2": 60000,
+    "clipdrop": 150000
+}
 
 # Инструкции для описания изображений и документов
 IMAGE_DESCRIPTION_INSTRUCTION = """Describe the scene, actions, text, or meme elements in the image. 
@@ -250,37 +311,7 @@ VARIATION_SUPPORTED_MODELS = [
 # We determine the Image_variation_Models Constant based on Variation_Supported_Models
 IMAGE_VARIATION_MODELS = VARIATION_SUPPORTED_MODELS
 
-# Permissible parties for different models
-MIDJOURNEY_ALLOWED_ASPECT_RATIOS = [
-    "1:1",      # Square
-    "16:9",     # Widescreen format
-    "9:16",     # Vertical variant of 16:9
-    "16:10",    # Alternative widescreen
-    "10:16",    # Vertical variant of 16:10
-    "8:5",      # Alternative widescreen
-    "5:8",      # Vertical variant of 16:10
-    "3:4",      # Portrait/print
-    "4:3",      # Standard TV/monitor format
-    "3:2",      # Popular in photography
-    "2:3",      # Inverse of 3:2
-    "4:5",      # Common in social media posts
-    "5:4",      # Nearly square format
-    "137:100",  # Academy ratio (1.37:1) as an integer ratio
-    "166:100",  # European cinema (1.66:1) as an integer ratio
-    "185:100",  # Cinematic format (1.85:1) as an integer ratio185
-    "83:50",    # European cinema (1.66:1) as an integer ratio
-    "37:20",    # Cinematic format (1.85:1) as an integer ratio
-    "2:1",      # Maximum allowed widescreen format
-    "1:2"       # Maximum allowed vertical format
-]
 
-FLUX_ALLOWED_ASPECT_RATIOS = ["1:1", "16:9", "9:16", "3:2", "2:3", "3:4", "4:3", "4:5", "5:4"]
-LEONARDO_ALLOWED_ASPECT_RATIOS = ["1:1", "4:3", "3:4"]
-
-# Permissible sizes for different models
-DALLE2_SIZES = ["1024x1024", "512x512", "256x256"]
-DALLE3_SIZES = ["1024x1024", "1024x1792", "1792x1024"]
-LEONARDO_SIZES = ALBEDO_SIZES = {"1:1": "1024x1024", "4:3": "1024x768", "3:4": "768x1024"}
 
 # Determination of models for speech synthesis (TTS)
 TEXT_TO_SPEECH_MODELS = [
