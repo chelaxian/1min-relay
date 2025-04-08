@@ -1,4 +1,4 @@
-# version 1.0.1 #increment every time you make changes
+# version 1.0.3 #increment every time you make changes
 # utils/common.py
 # Общие утилиты
 from .imports import *
@@ -20,20 +20,60 @@ def calculate_token(sentence, model="DEFAULT"):
         return 0
         
     try:
+        # Если это аудио модель (TTS или STT), используем специальную логику
+        if model in TEXT_TO_SPEECH_MODELS:
+            # Для TTS считаем количество символов и слов
+            char_count = len(sentence)
+            word_count = len(sentence.split())
+            # Приблизительно 1 токен = 4 символа или 0.75 слова
+            token_count = max(char_count // 4, word_count * 3 // 4)
+            logger.debug(f"Подсчет токенов для TTS модели {model}: {token_count} токенов")
+            return token_count
+            
+        if model in SPEECH_TO_TEXT_MODELS:
+            # Whisper и другие STT модели работают с аудио, поэтому возвращаем 0
+            # Для них токены считаются отдельно по длительности аудио
+            return 0
+        
         # Выбираем энкодер в зависимости от модели
         encoder_name = "gpt-4"  # Дефолтный энкодер
         
-        if model.startswith("mistral"):
+        # OpenAI модели
+        if model in ["gpt-3.5-turbo", "gpt-4", "gpt-4o", "gpt-4o-mini", "o1-preview", "o1-mini", "o3-mini"]:
+            encoder_name = "gpt-4"  # Для новых моделей OpenAI используем gpt-4 токенизатор
+        
+        # Модели Anthropic (Claude)
+        elif model.startswith("claude"):
+            encoder_name = "cl100k_base"  # Claude использует токенизатор, похожий на cl100k
+        
+        # Модели Mistral
+        elif model.startswith("mistral") or "mixtral" in model:
             encoder_name = "gpt-4"  # Для Mistral используем OpenAI токенизатор
-        elif model in ["gpt-3.5-turbo", "gpt-4"]:
-            encoder_name = model
+        
+        # Модели LLaMA
+        elif "llama" in model.lower():
+            encoder_name = "gpt-4"  # LLaMA близок к токенизации GPT
+        
+        # Модели Google (Gemini)
+        elif model.startswith("gemini"):
+            encoder_name = "cl100k_base"  # Gemini ближе к cl100k
+            
+        # Другие модели, основанные на трансформерах
+        elif any(m in model.lower() for m in ["command", "deepseek", "grok", "falcon", "mpt"]):
+            encoder_name = "gpt-4"  # Большинство моделей близки к GPT токенизации
             
         # Получаем токенизатор и считаем токены
-        encoding = tiktoken.encoding_for_model(encoder_name)
+        try:
+            # Сначала пробуем получить энкодер по имени модели
+            encoding = tiktoken.encoding_for_model(encoder_name)
+        except KeyError:
+            # Если не удалось, используем базовый энкодер cl100k_base
+            encoding = tiktoken.get_encoding("cl100k_base")
+            
         tokens = encoding.encode(sentence)
         return len(tokens)
     except Exception as e:
-        logger.warning(f"Ошибка при подсчете токенов: {str(e)}. Используем приблизительную оценку.")
+        logger.warning(f"Ошибка при подсчете токенов для модели {model}: {str(e)}. Используем приблизительную оценку.")
         # Приблизительно оцениваем количество токенов как 3/4 количества символов
         return len(sentence) * 3 // 4
 
@@ -309,3 +349,96 @@ def split_text_for_streaming(text, chunk_size=6):
         chunks.append(" ".join(current_chunk))
 
     return chunks or [text]
+
+def calculate_image_cost(model, mode=None, aspect_ratio=None):
+    """
+    Рассчитывает стоимость генерации изображения в условных единицах.
+    
+    Args:
+        model (str): Название модели для генерации изображения
+        mode (str, optional): Режим генерации (fast/relax, для Midjourney)
+        aspect_ratio (str, optional): Соотношение сторон (для некоторых моделей)
+        
+    Returns:
+        int: Стоимость в условных единицах
+    """
+    # Проверяем, является ли запрос генерацией изображения или вариацией
+    if model in IMAGE_GENERATION_PRICES:
+        price_data = IMAGE_GENERATION_PRICES.get(model)
+        
+        # Для моделей с разными режимами (Midjourney)
+        if isinstance(price_data, dict) and mode:
+            return price_data.get(mode.lower(), price_data.get("fast", 120000))
+        
+        # Для обычных моделей
+        if isinstance(price_data, int):
+            return price_data
+            
+        # Если не удалось определить цену
+        logger.warning(f"Не удалось определить цену для генерации изображения с моделью {model}")
+        return 120000  # Значение по умолчанию
+    
+    # Для вариаций изображений
+    elif model in IMAGE_VARIATION_PRICES:
+        price_data = IMAGE_VARIATION_PRICES.get(model)
+        
+        # Для моделей с разными режимами (Midjourney)
+        if isinstance(price_data, dict) and mode:
+            return price_data.get(mode.lower(), price_data.get("fast", 150000))
+        
+        # Для обычных моделей
+        if isinstance(price_data, int):
+            return price_data
+            
+        # Если не удалось определить цену
+        logger.warning(f"Не удалось определить цену для вариации изображения с моделью {model}")
+        return 150000  # Значение по умолчанию
+    
+    # Для неизвестной модели
+    logger.warning(f"Неизвестная модель {model} для расчета стоимости изображения")
+    return 120000  # Значение по умолчанию
+
+def calculate_audio_cost(model, duration_seconds=None, text=None):
+    """
+    Рассчитывает стоимость аудио операций в условных единицах.
+    
+    Args:
+        model (str): Название модели для аудио операции (TTS или STT)
+        duration_seconds (float, optional): Длительность аудио в секундах (для STT)
+        text (str, optional): Текст для озвучивания (для TTS)
+        
+    Returns:
+        int: Стоимость в условных единицах
+    """
+    # Стоимость TTS моделей (преобразование текста в речь)
+    if model in TEXT_TO_SPEECH_MODELS:
+        if text is None:
+            return 0
+            
+        # Получаем цену из констант
+        base_price = TTS_PRICES.get(model, 15000)
+        
+        # Рассчитываем стоимость на основе длины текста (1000 символов = базовая стоимость)
+        char_count = len(text)
+        cost = max(1, char_count) * base_price // 1000
+        
+        logger.debug(f"Расчет стоимости TTS для модели {model}: текст {char_count} символов, стоимость {cost}")
+        return cost
+        
+    # Стоимость STT моделей (распознавание речи)
+    elif model in SPEECH_TO_TEXT_MODELS:
+        if duration_seconds is None:
+            return 0
+            
+        # Получаем цену из констант
+        base_price = STT_PRICES.get(model, 6000)
+        
+        # Рассчитываем стоимость на основе длительности (60 секунд = базовая стоимость)
+        cost = max(1, int(duration_seconds)) * base_price // 60
+        
+        logger.debug(f"Расчет стоимости STT для модели {model}: аудио {duration_seconds} секунд, стоимость {cost}")
+        return cost
+    
+    # Для неизвестной модели
+    logger.warning(f"Неизвестная аудио модель {model} для расчета стоимости")
+    return 10000  # Значение по умолчанию
