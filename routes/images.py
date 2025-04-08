@@ -1,3 +1,4 @@
+# version 1.0.1 #increment every time you make changes
 # routes/images.py
 
 # Импортируем только необходимые модули
@@ -11,7 +12,8 @@ from utils.common import (
     create_session, 
     api_request, 
     safe_temp_file, 
-    calculate_token
+    calculate_token,
+    calculate_image_cost
 )
 from utils.memcached import safe_memcached_operation
 from routes.functions.shared_func import validate_auth, handle_api_error, format_image_response, get_full_url, extract_image_urls
@@ -82,6 +84,14 @@ def generate_image():
             return jsonify({"error": "No prompt provided"}), 400
 
     logger.info(f"[{request_id}] Using model: {model}, prompt: '{prompt}'")
+    
+    # Рассчитываем примерную стоимость операции
+    prompt_tokens = calculate_token(prompt, "gpt-4")
+    if negative_prompt:
+        prompt_tokens += calculate_token(negative_prompt, "gpt-4")
+    
+    cost = calculate_image_cost(model, mode=mode)
+    logger.info(f"[{request_id}] Estimated image generation cost: {cost} units, prompt has ~{prompt_tokens} tokens, model: {model}, mode: {mode or 'default'}")
 
     try:
         api_url = f"{ONE_MIN_API_URL}"
@@ -256,6 +266,19 @@ def image_variations():
     size = request.form.get("size", "1024x1024")
     prompt_text = request.form.get("prompt", "")
     relative_image_path = request.form.get("image_path")
+    
+    # Обнаружение режима для моделей, требующих этого параметра (Midjourney)
+    mode = request.form.get("mode", "fast")
+    if prompt_text:
+        mode_match = re.search(r'(--|\u2014)(fast|relax)\s*', prompt_text)
+        if mode_match:
+            mode = mode_match.group(2)
+            logger.debug(f"[{request_id}] Extracted mode from prompt: {mode}")
+    
+    # Рассчитываем примерную стоимость операции для вариации
+    cost = calculate_image_cost(original_model, mode=mode)
+    logger.info(f"[{request_id}] Estimated image variation cost: {cost} units for model: {original_model}, mode: {mode}")
+    
     if relative_image_path:
         logger.debug(f"[{request_id}] Using relative image path: {relative_image_path}")
     logger.debug(f"[{request_id}] Original model requested: {original_model} for image variations")
@@ -492,6 +515,3 @@ def image_variations():
     session.close()
     logger.info(f"[{request_id}] Successfully generated {len(openai_data)} image variations using model {current_model}")
     return jsonify(openai_response), 200
-
-
-
