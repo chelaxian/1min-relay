@@ -1,4 +1,4 @@
-# version 1.0.5 #increment every time you make changes
+# version 1.0.6 #increment every time you make changes
 # utils/constants.py
 # Файл констант для приложения
 
@@ -111,6 +111,17 @@ IMAGE_VARIATION_PRICES = {
     "midjourney_6_1": {"relax": 90000, "fast": 150000},
     "dall-e-2": 60000,
     "clipdrop": 150000
+}
+
+# Цены на синтез речи (TTS) (в условных единицах за 1000 символов)
+TTS_PRICES = {
+    "tts-1": 15000,      # ~$0.015 / 1K символов
+    "tts-1-hd": 30000    # ~$0.030 / 1K символов
+}
+
+# Цены на распознавание речи (STT) (в условных единицах за минуту)
+STT_PRICES = {
+    "whisper-1": 6000    # ~$0.006 / минута
 }
 
 # Инструкции для описания изображений и документов
