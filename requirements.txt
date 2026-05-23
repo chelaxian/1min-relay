@@ -8,7 +8,7 @@ limits[memcached]==5.8.0
 coloredlogs==15.0.1
 printedcolors==1.0.0
 pymemcache==4.0.0
-tiktoken>=0.7.0
+tiktoken>=0.13.0
 python-memcached==1.62
 python-dotenv==1.2.2
 werkzeug>=3.1.0
